@@ -112,9 +112,13 @@
 #define EMDA_CMD_QUEUE_SIZE (8U)
 #endif
 
-/* URC回调表最大条目数 */
+/*
+ * URC 回调表最大条目数。
+ * ML307A 类自己占用 7 条(MIPURC rtcp/rudp + MIPOPEN + MIPCLOSE + MIPURC +
+ * MQTTURC publish + MQTTURC 通用)，留 12 给业务再加几条。
+ */
 #ifndef EMDA_URC_TABLE_SIZE
-#define EMDA_URC_TABLE_SIZE (8U)
+#define EMDA_URC_TABLE_SIZE (12U)
 #endif
 
 /* 名称最大长度(监控项名/URC注册名，含'\0') */

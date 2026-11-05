@@ -903,7 +903,8 @@ int emda_ml307a_mqtt_publish(int cid, const char *topic,
     {
         return EMDA_EINVAL;
     }
-    if (len > ML307A_MQTT_MAX_PAYLOAD)
+    /* 实际发送受 AT 核心的原始数据缓冲限制(EMDA_TX_PAYLOAD_SIZE) */
+    if (len > EMDA_TX_PAYLOAD_SIZE)
     {
         return EMDA_ENOMEM;
     }

@@ -1,6 +1,6 @@
 # EMDA (Embedded Module Device AT) —— 通用 AT 模组组件
 
-> 版本：0.3 ｜ 更新日期：2026-11-06
+> 版本：0.4 ｜ 更新日期：2026-11-06
 > 协议：Apache License 2.0
 
 EMDA 是一个**可移植、可复用、非阻塞**的 AT 模组组件，结构参照 RT-Thread 的 `at_device`
@@ -63,7 +63,7 @@ Embedded-Devices-AT-Commands/
 │   └── emda_freertos_monitor.c 实际工程示例：存活/SIM/IP/MQTT 监控 + 断线重连
 ├── test/
 │   ├── fake_modem.h/.c         主机侧模拟模组（实现 emda_port 串口接口）
-│   └── test_main.c             冒烟测试：监控阶梯 / 建链 / 收发 / URC / 超时
+│   └── test_main.c             冒烟测试：状态阶梯 / 接收定界 / socket / MQTT / 超时
 ├── document/                   模组手册与旧版设计说明
 ├── Makefile
 ├── build.ps1 / build.cmd
@@ -166,6 +166,15 @@ const emda_device_class_t emda_class_ml307a = {
     .sock_num = EMDA_SOCK_MAX,
 };
 ```
+
+除 `sock_ops` 外，ML307A 还直接暴露一组 **MQTT 接口**（模组内置协议栈，不是 socket 的封装）：
+
+```c
+emda_ml307a_mqtt_connect / subscribe / publish / disconnect / connected / poll_state / set_msg_cb
+```
+
+MQTT 不走 `emda_socket`：连接、订阅、保活都由模组自己维护，库只负责下发命令、
+解析 `+MQTTURC`，并把下行 payload 按长度交给业务回调。
 
 ML307A 的状态阶梯（全部由监控项驱动，没有一行阻塞代码）：
 
@@ -493,10 +502,10 @@ int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms) {
 | `EMDA_RX_BUFFER_SIZE` | 2048 | 接收环形缓冲（需容纳最长一条 URC） |
 | `EMDA_RESP_BUFFER_SIZE` | 1024 | 单条响应累积文本缓冲 |
 | `EMDA_RX_READS_PER_POLL` | 4 | 单次轮询最多读几批串口数据 |
-| `EMDA_TX_PAYLOAD_SIZE` | 512 | 两段式发送的原始数据上限 |
+| `EMDA_TX_PAYLOAD_SIZE` | 512 | 两段式发送的原始数据上限（也决定 MQTT publish 单包上限） |
 | `EMDA_MONITOR_MAX` | 16 | 监控项容量 |
 | `EMDA_CMD_QUEUE_SIZE` | 8 | 指令队列容量 |
-| `EMDA_URC_TABLE_SIZE` | 8 | URC 回调表容量 |
+| `EMDA_URC_TABLE_SIZE` | 12 | URC 回调表容量（ML307A 类占 7 条，其余留给业务） |
 | `EMDA_NAME_LEN` | 24 | 监控项/URC 名称长度 |
 | `EMDA_SOCK_MAX` | 4 | socket 路数（受模组 connect_id 限制） |
 | `EMDA_SOCK_RX_BUFFER_SIZE` | 512 | 单路接收缓冲 |
@@ -519,14 +528,27 @@ int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms) {
 ## 十、主机测试
 
 `test/` 里有一个**模拟模组**（实现 `emda_port` 串口接口，用脚本应答 AT 指令，
-还能限制每次读的字节数来模拟 DMA 分片），可以在 PC 上把整条链路跑一遍：
+还能切换驻网状态、限制每次读的字节数来模拟 DMA 分片），可以在 PC 上把整条链路跑一遍（共 46 项断言）：
 
-- 监控阶梯 → 建链 → 发送 → 关闭 → 超时
+**状态机**
+
+- 监控阶梯 `ATE0 → CPIN → CEREG → CGATT` 一路到 READY
+- `AT+CGDCONT` 在 INIT 阶段正确下发（APN 可选项）
+- `CEREG stat=3`（注册被拒）→ FAILED，之后慢速重试回 READY
+- 业务临时指令的正常响应与超时兜底
+
+**接收定界**
+
 - **payload 含 `\r\n` 且恰好被分片切断**
 - **payload 里伪造 `+MIPCLOSE: 0` 不能误关连接**
 - **payload 含 `0x00` 不截断**
 - **单条 1460 字节 URC 不卡死解析器**
 - **文本响应拆成 2 字节一片仍能匹配 `OK`**
+
+**socket 与 MQTT**
+
+- TCP 建链 → 发送 → 接收 → 关闭全流程
+- MQTT 连接（`conn` URC）→ 订阅 → 发布（`>` 数据模式）→ 下行消息 → 断开
 
 ```bash
 make test
