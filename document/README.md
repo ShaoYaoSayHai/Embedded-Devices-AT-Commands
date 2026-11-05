@@ -1,5 +1,9 @@
 # ADX (AT Device X) —— 通用AT模组通信库设计说明
 
+> **历史文档说明**：本文档记录 v0.2（`adx_` 前缀、单文件引擎）的设计与溯源。
+> v0.3 起项目更名为 **EMDA**，按 `at_client / at_device / at_socket` 的思路拆成
+> `emda_at` / `emda_device` / `emda_socket` 三层 + `class/` 模组类，最新架构见根目录 `README.md`。
+
 > 整理日期：2026-08-16
 > 
 > 本仓库包含两部分：

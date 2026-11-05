@@ -1,5 +1,5 @@
 # ============================================================
-# ADX (AT Device X) .gitignore
+# EMDA (Embedded Module Device AT) .gitignore
 # ============================================================
 
 # ---- 参考源码(原项目代码，仅作参考不提交) ----
@@ -19,6 +19,7 @@ source/task_module_serial_comm.h
 *.gz
 
 # ---- 构建产物 ----
+build/
 *.o
 *.obj
 *.elf
@@ -26,6 +27,8 @@ source/task_module_serial_comm.h
 *.hex
 *.map
 *.lst
+*.a
+*.exe
 
 # ---- IDE / 编辑器 ----
 .vscode/
