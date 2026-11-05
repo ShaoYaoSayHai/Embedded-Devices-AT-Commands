@@ -35,6 +35,7 @@ static char s_last_cmd[MODEM_CMD_SIZE];
 static int s_payload_id = -1;
 static int s_payload_need = 0;
 static int s_payload_got = 0;
+static int s_payload_kind = 0; /* 0=MIPSEND, 1=MQTTPUB */
 static uint8_t s_payload[MODEM_PAY_SIZE];
 
 /* 心跳 */
@@ -42,6 +43,12 @@ static volatile emda_tick_t s_tick = 0U;
 
 /* 单次读返回上限(模拟 DMA 分片)，0 = 不限 */
 static uint16_t s_read_limit = 0U;
+
+/* AT+CEREG? 返回的 <stat> */
+static int s_cereg_stat = 1;
+
+/* 是否收到过 AT+CGDCONT */
+static int s_saw_cgdcont = 0;
 
 /* ======================================================================== */
 /*                              内部工具                                     */
@@ -86,9 +93,19 @@ static void s_handle_cmd(const char *cmd)
         return;
     }
 
+    if (strncmp(cmd, "AT+CGDCONT=", 11) == 0)
+    {
+        s_saw_cgdcont = 1;
+        modem_write("OK\r\n");
+        return;
+    }
+
     if (strcmp(cmd, "AT+CEREG?") == 0)
     {
-        modem_write("+CEREG: 0,1\r\n\r\nOK\r\n");
+        char resp[32];
+
+        (void)snprintf(resp, sizeof(resp), "+CEREG: 0,%d\r\n\r\nOK\r\n", s_cereg_stat);
+        modem_write(resp);
         return;
     }
 
@@ -124,7 +141,72 @@ static void s_handle_cmd(const char *cmd)
         s_payload_id = id;
         s_payload_need = len;
         s_payload_got = 0;
+        s_payload_kind = 0;
         modem_write(">"); /* 提示符，无 CRLF */
+        return;
+    }
+
+    if (strncmp(cmd, "AT+MQTTCONN=", 12) == 0)
+    {
+        int id = atoi(cmd + 12);
+        char urc[40];
+
+        modem_write("OK\r\n");
+        (void)snprintf(urc, sizeof(urc), "+MQTTURC: \"conn\",%d,0\r\n", id);
+        modem_write(urc);
+        return;
+    }
+
+    if (strncmp(cmd, "AT+MQTTSUB=", 11) == 0)
+    {
+        int id = atoi(cmd + 11);
+        char resp[96];
+
+        (void)snprintf(resp, sizeof(resp),
+                       "+MQTTSUB: %d,100\r\nOK\r\n+MQTTURC: \"suback\",%d,100,1\r\n",
+                       id, id);
+        modem_write(resp);
+        return;
+    }
+
+    if (strncmp(cmd, "AT+MQTTPUB=", 11) == 0)
+    {
+        int id = 0;
+        int qos = 0;
+        int retain = 0;
+        int dup = 0;
+        int len = 0;
+        char topic[64];
+
+        /* AT+MQTTPUB=<id>,"topic",<qos>,<retain>,<dup>,<len> */
+        if (sscanf(cmd + 11, "%d,\"%63[^\"]\",%d,%d,%d,%d",
+                   &id, topic, &qos, &retain, &dup, &len) == 6)
+        {
+            s_payload_id = id;
+            s_payload_need = len;
+            s_payload_got = 0;
+            s_payload_kind = 1;
+            modem_write(">");
+            return;
+        }
+        modem_write("ERROR\r\n");
+        return;
+    }
+
+    if (strncmp(cmd, "AT+MQTTDISC=", 12) == 0)
+    {
+        int id = atoi(cmd + 12);
+        char urc[40];
+
+        modem_write("OK\r\n");
+        (void)snprintf(urc, sizeof(urc), "+MQTTURC: \"conn\",%d,2\r\n", id);
+        modem_write(urc);
+        return;
+    }
+
+    if (strncmp(cmd, "AT+MQTTSTATE=", 13) == 0)
+    {
+        modem_write("+MQTTSTATE: 2\r\n\r\nOK\r\n");
         return;
     }
 
@@ -151,12 +233,22 @@ static void s_payload_done(void)
 {
     char resp[64];
 
-    (void)snprintf(resp, sizeof(resp), "+MIPSEND: %d,%d\r\nOK\r\n",
-                   s_payload_id, s_payload_need);
+    if (s_payload_kind == 1)
+    {
+        (void)snprintf(resp, sizeof(resp), "+MQTTPUB: %d,200,%d\r\nOK\r\n",
+                       s_payload_id, s_payload_need);
+    }
+    else
+    {
+        (void)snprintf(resp, sizeof(resp), "+MIPSEND: %d,%d\r\nOK\r\n",
+                       s_payload_id, s_payload_need);
+    }
     modem_write(resp);
+
     s_payload_id = -1;
     s_payload_need = 0;
     s_payload_got = 0;
+    s_payload_kind = 0;
 }
 
 /* ======================================================================== */
@@ -171,8 +263,21 @@ void fake_modem_reset(void)
     s_payload_id = -1;
     s_payload_need = 0;
     s_payload_got = 0;
+    s_payload_kind = 0;
     s_tick = 0U;
     s_read_limit = 0U;
+    s_cereg_stat = 1;
+    s_saw_cgdcont = 0;
+}
+
+void fake_modem_set_cereg_stat(int stat)
+{
+    s_cereg_stat = stat;
+}
+
+int fake_modem_saw_cgdcont(void)
+{
+    return s_saw_cgdcont;
 }
 
 void fake_modem_set_read_limit(uint16_t limit)
@@ -214,6 +319,19 @@ void fake_modem_inject_data_part1(int id, const char *data, int part_len)
 void fake_modem_inject_data_part2(const char *data_tail)
 {
     modem_write(data_tail);
+    modem_write("\r\n");
+}
+
+void fake_modem_inject_mqtt_publish(int cid, const char *topic, const char *payload)
+{
+    char head[96];
+    uint16_t plen = (uint16_t)strlen(payload);
+
+    (void)snprintf(head, sizeof(head),
+                   "+MQTTURC: \"publish\",%d,7,\"%s\",%u,%u,",
+                   cid, topic, (unsigned)plen, (unsigned)plen);
+    modem_write(head);
+    modem_write_raw(payload, plen);
     modem_write("\r\n");
 }
 

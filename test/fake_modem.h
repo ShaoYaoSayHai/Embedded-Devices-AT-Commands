@@ -28,11 +28,23 @@ void fake_modem_inject_data_bin(int id, const uint8_t *data, uint16_t len);
  */
 void fake_modem_set_read_limit(uint16_t limit);
 
+/*
+ * 设置 AT+CEREG? 返回的 <stat>：
+ *   1/5 已驻网, 2 搜网中, 3 注册被拒(用于验证 FAILED 分支)
+ */
+void fake_modem_set_cereg_stat(int stat);
+
 /* 注入数据上报的前半段(用于验证 URC 分片重组) */
 void fake_modem_inject_data_part1(int id, const char *data, int part_len);
 
 /* 注入数据上报的后半段 */
 void fake_modem_inject_data_part2(const char *data_tail);
+
+/* 注入一条 MQTT 下行消息 URC：+MQTTURC: "publish",<id>,<mid>,"topic",<total>,<len>,<payload> */
+void fake_modem_inject_mqtt_publish(int cid, const char *topic, const char *payload);
+
+/* 是否收到过 AT+CGDCONT（验证 APN 配置真的下发了） */
+int fake_modem_saw_cgdcont(void);
 
 /* 最后一次收到的完整指令(便于断言) */
 const char *fake_modem_last_cmd(void);

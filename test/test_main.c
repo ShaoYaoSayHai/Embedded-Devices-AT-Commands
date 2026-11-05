@@ -62,6 +62,26 @@ static void on_sock_evt(int sock, emda_sock_event_t evt)
 static int s_exec_ok = 0;
 static int s_exec_timeout = 0;
 
+/* MQTT 下行消息记录 */
+static int s_mqtt_msg_got = 0;
+static char s_mqtt_topic[32];
+static uint8_t s_mqtt_payload[32];
+static int s_mqtt_len = 0;
+
+static void on_mqtt_msg(int cid, const char *topic,
+                        const uint8_t *payload, uint16_t len)
+{
+    (void)cid;
+
+    s_mqtt_msg_got = 1;
+    strncpy(s_mqtt_topic, topic, sizeof(s_mqtt_topic) - 1U);
+    s_mqtt_topic[sizeof(s_mqtt_topic) - 1U] = '\0';
+
+    s_mqtt_len = (len < (uint16_t)sizeof(s_mqtt_payload)) ? (int)len
+                                                          : (int)sizeof(s_mqtt_payload);
+    memcpy(s_mqtt_payload, payload, (size_t)s_mqtt_len);
+}
+
 static int on_exec_resp(uint8_t *buffer, uint16_t len)
 {
     (void)len;
@@ -133,11 +153,15 @@ int main(void)
     /* ---- 1. 设备层：绑定模组类并启动 ---- */
     CHECK(emda_device_register(&emda_class_ml307a, NULL) == EMDA_EOK,
           "register ml307a class");
+    CHECK(emda_ml307a_set_apn("CMIOT") == EMDA_EOK, "set apn before start");
     CHECK(emda_device_start() == EMDA_EOK, "device start");
+
+    emda_ml307a_mqtt_set_msg_cb(on_mqtt_msg);
 
     /* ---- 2. 监控阶梯：UNKNOWN -> ... -> READY ---- */
     CHECK(wait_net_state(EMDA_NET_STATE_READY, 3000) == 1,
           "monitor ladder reaches READY (AT/CPIN/CEREG/CGATT)");
+    CHECK(fake_modem_saw_cgdcont() == 1, "AT+CGDCONT issued during INIT");
 
     run_ms(200);
     CHECK(emda_device_control(EMDA_ML307A_CTRL_GET_CSQ, csq) == EMDA_EOK,
@@ -249,6 +273,40 @@ int main(void)
           "device exec no-response queued");
     run_ms(400);
     CHECK(s_exec_timeout == 1, "timeout callback fired");
+
+    /* ---- 13. 驻网被拒 -> FAILED，之后慢速恢复 ---- */
+    fake_modem_set_cereg_stat(3);
+    CHECK(wait_net_state(EMDA_NET_STATE_FAILED, 40000) == 1,
+          "CEREG stat=3 (registration denied) leads to FAILED");
+
+    fake_modem_set_cereg_stat(1);
+    CHECK(wait_net_state(EMDA_NET_STATE_READY, 40000) == 1,
+          "FAILED recovers to READY by slow retry");
+
+    /* ---- 14. MQTT：连接 -> 订阅 -> 发布 -> 下行 -> 断开 ---- */
+    CHECK(emda_ml307a_mqtt_connect(0, "broker.emqx.io", 1883, "dev1", "u", "p") == EMDA_EOK,
+          "mqtt connect issued");
+    run_ms(400);
+    CHECK(emda_ml307a_mqtt_connected(0) == 1, "mqtt conn URC marks connected");
+
+    CHECK(emda_ml307a_mqtt_subscribe(0, "dev/down", 1) == EMDA_EOK,
+          "mqtt subscribe issued");
+    run_ms(300);
+
+    CHECK(emda_ml307a_mqtt_publish(0, "dev/up", (const uint8_t *)"hello", 5, 0) == EMDA_EOK,
+          "mqtt publish uses data mode");
+    run_ms(400);
+
+    fake_modem_inject_mqtt_publish(0, "dev/down", "reboot");
+    run_ms(300);
+    CHECK(s_mqtt_msg_got == 1, "mqtt downlink delivered");
+    CHECK(strcmp(s_mqtt_topic, "dev/down") == 0, "mqtt topic parsed");
+    CHECK(s_mqtt_len == 6 && memcmp(s_mqtt_payload, "reboot", 6) == 0,
+          "mqtt payload parsed by length");
+
+    CHECK(emda_ml307a_mqtt_disconnect(0) == EMDA_EOK, "mqtt disconnect issued");
+    run_ms(400);
+    CHECK(emda_ml307a_mqtt_connected(0) == 0, "conn state 2 marks disconnected");
 
     CHECK(s_evt_connect_failed == 0, "no unexpected connect failure");
 

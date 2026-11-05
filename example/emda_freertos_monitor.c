@@ -1,26 +1,26 @@
 /**
  * @file emda_freertos_monitor.c
  * @author Zorian(1551769443@qq.com)
- * @brief  EMDA 在 FreeRTOS 下的实际用法：模组存活 / SIM / IP / MQTT 状态监控
+ * @brief  EMDA 在 FreeRTOS 下的实际用法：开机自检 -> 驻网 -> IP -> MQTT
  *
- * 这个文件和真实项目里的写法一致，可以直接改改就用：
+ * 完整链路（指令依据 document/ML307A/ 手册）：
  *
- *   需求                指令                监控状态                     间隔
- *   ------------------  ------------------  ---------------------------  --------
- *   模组是否还活着       AT                  UNKNOWN / LOST               3s / 5s
- *   SIM 是否就绪         AT+CPIN?            INIT                         3s
- *   是否驻网             AT+CEREG?           REGISTERING                  3s
- *   数据附着             AT+CGATT?           REGISTERED                   2s
- *   信号质量             AT+CSQ              READY                        30s
- *   模组 IP 地址         AT+CGPADDR=1        READY                        60s
- *   MQTT 连接状态        AT+MQTTSTATE=0      READY                        30s
+ *   [0] 模组在线   AT / ATE0
+ *   [1] SIM        AT+CPIN?            (10 未插卡 11 需要PIN 13 卡失效 14 卡忙)
+ *   [2] 信号       AT+CSQ              (99 = 不可检测)
+ *   [3] 驻网       AT+CEREG?           (1/5/6/7/9 已注册，3 被拒)
+ *   [4] 附着+IP    AT+CGATT? / AT+MIPCALL?
+ *   [5] MQTT       AT+MQTTCONN / AT+MQTTSUB / AT+MQTTPUB / AT+MQTTDISC
  *
- * 前 5 行由模组类 class/emda_class_ml307a.c 内置（ATE0/CPIN/CEREG/CGATT/CSQ），
- * 本文件只追加后 2 行，并处理 MQTT 的连接结果 URC 与重连。
+ * [0]~[4] 全部由 class/emda_class_ml307a.c 的状态阶梯自动完成，
+ * 本文件只做三件事：追加 IP 巡检、驱动 MQTT 连接状态机、处理下行消息。
+ *
+ * 注意：ML307A 是自动拨号，手册明确不建议用 AT+CGACT 手工激活 PDP，
+ *       第 1 路默认承载由模组自动配置，所以这里不出现 CGDCONT/CGACT。
  *
  * 编译：需要 FreeRTOS 头文件，且 EMDA_HEARTBEAT_PERIOD_MS 必须等于 RTOS tick 周期。
  *
- * @version 0.4
+ * @version 0.5
  * @date 2026-11-06
  *
  * @copyright Copyright (c) 2026
@@ -28,7 +28,6 @@
  */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "FreeRTOS.h"
@@ -44,22 +43,36 @@
 /*                              应用配置                                     */
 /* ======================================================================== */
 
+/*
+ * APN 是选择性配置，不是必须的。
+ *
+ * eSIM 只是卡的物理形态(嵌入式芯片 + 远程写 profile)，和 APN 无关：
+ *   - eSIM 里装的是公网 profile -> 一般用模组默认 APN 即可，不用配；
+ *   - eSIM 里装的是物联网 profile(CMIOT/CTNET/UNINET 等) 且模组自动配置
+ *     没对上 -> 才需要手工配一次。
+ *
+ * 判断方法：先不配 APN 跑一遍，若 AT+MIPCALL? 长期是 state=0 或地址为空，
+ * 再打开下面这两行（宏 + emda_task 里的调用）试。
+ * 注意手工配置的 APN 掉电不保存，库会在每次开机的 INIT 阶段重配一次。
+ */
+/* #define APP_APN               "CMIOT" */
+
 #define APP_MQTT_ID           (0)
-#define APP_MQTT_HOST         "mqtt.example.com"
+#define APP_MQTT_HOST         "broker.emqx.io"
 #define APP_MQTT_PORT         (1883)
 #define APP_MQTT_CLIENT_ID    "dev-0001"
 #define APP_MQTT_USER         "device"
 #define APP_MQTT_PASS         "secret"
 #define APP_MQTT_TOPIC_UP     "dev/0001/up"
+#define APP_MQTT_TOPIC_DOWN   "dev/0001/down"
 
-#define APP_MQTT_RETRY_MS     (5000U)  /* 重连间隔 */
-#define APP_MQTT_PROBE_MS     (30000U) /* MQTT 状态巡检间隔 */
+#define APP_MQTT_RETRY_MS     (5000U)  /* 掉线重连间隔 */
+#define APP_MQTT_PROBE_MS     (30000U) /* 已连接时的状态兜底巡检 */
 #define APP_IP_PROBE_MS       (60000U) /* IP 巡检间隔 */
 #define APP_CMD_TIMEOUT_MS    (2000U)
-#define APP_MQTT_CONN_TO_MS   (30000U) /* 建链最多等 30s(URC 才给结果) */
 
 #define APP_TASK_STACK_WORDS  (1536U)
-#define APP_TASK_PRIO         (4U)     /* 比串口中断低，比业务任务略高即可 */
+#define APP_TASK_PRIO         (4U)
 
 /*
  * 关键：EMDA_HEARTBEAT_PERIOD_MS 必须等于 FreeRTOS 的 tick 周期，
@@ -81,111 +94,50 @@
 static volatile int s_ip_valid = 0;
 static char s_ip[24];
 
-static volatile int s_mqtt_connected = 0;  /* 业务视角：MQTT 可用 */
-static volatile int s_mqtt_pending = 0;    /* 已下发 AT+MQTTCONN，等 URC */
 static emda_tick_t s_last_conn_tick = 0;
+static emda_tick_t s_last_probe_tick = 0;
+static int s_subscribed = 0;
+static int s_was_connected = 0;
 
 /* ======================================================================== */
-/*                          MQTT 状态解析                                     */
+/*                          下行消息回调                                     */
 /* ======================================================================== */
-/*
- * 注意两个状态枚举完全不同，不能共用解析：
- *   AT+MQTTSTATE -> +MQTTSTATE: <state>   1=连接中/重连 2=连接成功 3=连接断开
- *   URC          -> +MQTTURC: "conn",<id>,<conn_state>
- *                                          0=连接成功 1=正在重连 2=客户端断开
- *                                          3=服务器拒绝 4=服务器断开
- */
-
-/* 从字符串里跳过逗号读一个整数(用于解析 URC 的数值字段) */
-static const char *s_int_field(const char *p, int *out)
-{
-    while (*p != '\0' && *p != ',')
-    {
-        p++;
-    }
-    if (*p != ',')
-    {
-        return NULL;
-    }
-
-    *out = atoi(p + 1);
-    return p + 1;
-}
 
 /**
- * @brief MQTT URC：+MQTTURC: "conn",<id>,<conn_state>
+ * @brief MQTT 下行消息（payload 是原始字节，可能含 0x00，必须按 len 处理）
+ */
+static void on_mqtt_msg(int cid, const char *topic,
+                        const uint8_t *payload, uint16_t len)
+{
+    char text[64];
+    uint16_t n = (len < (uint16_t)(sizeof(text) - 1U)) ? len : (uint16_t)(sizeof(text) - 1U);
+
+    memcpy(text, payload, n);
+    text[n] = '\0';
+
+    EMDA_LOG("[app] mqtt rx cid=%d topic=%s len=%u: %s\r\n",
+             cid, topic, (unsigned)len, text);
+
+    /* 业务处理：命令下发、OTA 通知等 */
+}
+
+/* ======================================================================== */
+/*                          监控项（应用层追加）                              */
+/* ======================================================================== */
+
+/**
+ * @brief AT+MIPCALL? -> +MIPCALL: <cid>,<state>,"<ipv4>"[,"<ipv6>"]
  *
- * 注意这里是"行模式"解析：publish 的 payload 里可能含 \r\n，
- * 如果需要订阅大报文，应按长度定界写法(参考 class 里的 s_rtcp_seg_len)。
+ * 这是 ML307A 应用层拨号状态，比标准 3GPP 的 +CGPADDR 更贴合模组模型：
+ *   state=1 表示该路 PDP 已拨号成功，后面跟实际分配的地址。
+ *   CEREG=1 只代表注册成功，不代表已拨号拿到 IP。
+ *
+ * 注意：ML307A 是自动拨号，别用 AT+CGACT 去激活 PDP（手册明确不建议），
+ *       需要断开时用 AT+MIPCALL=0,<cid>，需要去激活用 AT+CFUN=4。
  */
-static int urc_mqtt(const uint8_t *data, uint16_t len)
+static int cb_mipcall(uint8_t *buffer, uint16_t len)
 {
-    char line[96];
-    uint16_t n;
-    const char *p;
-    int id = 0;
-    int state = -1;
-
-    if (data == NULL || len == 0U)
-    {
-        return EMDA_ERROR;
-    }
-
-    n = (len < (uint16_t)(sizeof(line) - 1U)) ? len : (uint16_t)(sizeof(line) - 1U);
-    memcpy(line, data, n);
-    line[n] = '\0';
-
-    if (strstr(line, "\"conn\"") != NULL)
-    {
-        p = s_int_field(line, &id);
-        if (p == NULL || s_int_field(p, &state) == NULL)
-        {
-            return EMDA_ERROR;
-        }
-
-        switch (state)
-        {
-        case 0: /* 连接成功 */
-            s_mqtt_connected = 1;
-            s_mqtt_pending = 0;
-            break;
-
-        case 1: /* 正在重连：等模组自己恢复，不重复下发 MQTTCONN */
-            s_mqtt_connected = 0;
-            s_mqtt_pending = 1;
-            break;
-
-        default: /* 2=客户端断开 3=服务器拒绝 4=服务器断开 */
-            s_mqtt_connected = 0;
-            s_mqtt_pending = 0;
-            break;
-        }
-        return EMDA_EOK;
-    }
-
-    if (strstr(line, "\"drop\"") != NULL || strstr(line, "\"timeout\"") != NULL)
-    {
-        EMDA_LOG("[app] mqtt urc: %s\r\n", line);
-        return EMDA_EOK;
-    }
-
-    return EMDA_ERROR;
-}
-
-static const emda_urc_t s_app_urc[] = {
-    {"+MQTTURC:", NULL, urc_mqtt},
-};
-
-/* ======================================================================== */
-/*                          监控项响应回调                                    */
-/* ======================================================================== */
-
-/**
- * @brief AT+CGPADDR=1 -> +CGPADDR: 1,"10.12.34.56"
- */
-static int cb_ipaddr(uint8_t *buffer, uint16_t len)
-{
-    const char *p = strstr((const char *)buffer, "+CGPADDR:");
+    const char *p = strstr((const char *)buffer, "+MIPCALL:");
     const char *q;
     size_t n;
 
@@ -196,19 +148,50 @@ static int cb_ipaddr(uint8_t *buffer, uint16_t len)
         return EMDA_ERROR;
     }
 
-    p = strchr(p, ',');
-    if (p == NULL)
-    {
-        return EMDA_ERROR;
-    }
-    p++;
-    while (*p == '"')
+    p += 9; /* 跳过 "+MIPCALL:" */
+    while (*p == ' ')
     {
         p++;
     }
 
+    /* <cid> */
+    if (*p < '0' || *p > '9')
+    {
+        return EMDA_ERROR;
+    }
+    while (*p >= '0' && *p <= '9')
+    {
+        p++;
+    }
+    if (*p != ',')
+    {
+        return EMDA_ERROR;
+    }
+    p++;
+
+    /* <state>：0=未拨号 1=已连接 */
+    if (*p != '1')
+    {
+        s_ip_valid = 0;
+        return EMDA_EOK;
+    }
+    while (*p >= '0' && *p <= '9')
+    {
+        p++;
+    }
+    if (*p != ',')
+    {
+        return EMDA_ERROR;
+    }
+    p++;
+
+    /* "<ipv4>" */
+    if (*p == '"')
+    {
+        p++;
+    }
     q = p;
-    while (*q != '\0' && *q != '"' && *q != '\r' && *q != '\n')
+    while (*q != '\0' && *q != '"')
     {
         q++;
     }
@@ -216,30 +199,13 @@ static int cb_ipaddr(uint8_t *buffer, uint16_t len)
     n = (size_t)(q - p);
     if (n == 0U || n >= sizeof(s_ip))
     {
-        return EMDA_ERROR;
+        s_ip_valid = 0;
+        return EMDA_EOK;
     }
 
     memcpy(s_ip, p, n);
     s_ip[n] = '\0';
     s_ip_valid = 1;
-    return EMDA_EOK;
-}
-
-/**
- * @brief AT+MQTTSTATE=0 -> +MQTTSTATE: 2
- */
-static int cb_mqtt_state(uint8_t *buffer, uint16_t len)
-{
-    const char *p = strstr((const char *)buffer, "+MQTTSTATE:");
-
-    (void)len;
-
-    if (p == NULL)
-    {
-        return EMDA_ERROR;
-    }
-
-    s_mqtt_connected = (atoi(p + 11) == 2) ? 1 : 0;
     return EMDA_EOK;
 }
 
@@ -249,30 +215,13 @@ static int cb_mon_timeout(char *cmd)
     return EMDA_EOK;
 }
 
-/* ======================================================================== */
-/*                          应用层追加的监控项                                */
-/* ======================================================================== */
-
-/*
- * 这些项在 emda_device_start() 之后追加，不需要改库。
- * state 字段表示"只在模组处于该状态时才调度"。
- */
 static const emda_monitor_t s_app_monitors[] = {
     {
         .name = "ipaddr",
-        .cmd = "AT+CGPADDR=1\r\n",
+        .cmd = "AT+MIPCALL?\r\n",
         .state = EMDA_NET_STATE_READY,
         .interval_ms = APP_IP_PROBE_MS,
-        .resp_cb = cb_ipaddr,
-        .timeout_cb = cb_mon_timeout,
-        .timeout_ms = APP_CMD_TIMEOUT_MS,
-    },
-    {
-        .name = "mqtt_state",
-        .cmd = "AT+MQTTSTATE=0\r\n",
-        .state = EMDA_NET_STATE_READY,
-        .interval_ms = APP_MQTT_PROBE_MS,
-        .resp_cb = cb_mqtt_state,
+        .resp_cb = cb_mipcall,
         .timeout_cb = cb_mon_timeout,
         .timeout_ms = APP_CMD_TIMEOUT_MS,
     },
@@ -282,100 +231,68 @@ static const emda_monitor_t s_app_monitors[] = {
 /*                          MQTT 连接管理                                    */
 /* ======================================================================== */
 
-static int mqtt_conn_resp(uint8_t *buffer, uint16_t len)
-{
-    (void)len;
-
-    if (strstr((const char *)buffer, "OK") != NULL)
-    {
-        /* 命令已受理，真正的结果由 +MQTTURC: "conn" 上报 */
-        return EMDA_EOK;
-    }
-    if (strstr((const char *)buffer, "ERROR") != NULL)
-    {
-        s_mqtt_pending = 0;
-        return EMDA_EOK;
-    }
-    return EMDA_ERROR;
-}
-
-static int mqtt_conn_timeout(char *cmd)
-{
-    (void)cmd;
-    s_mqtt_pending = 0;
-    return EMDA_EOK;
-}
-
 /**
- * @brief 下发 MQTT 建链（业务层动作，不在 AT 回调里做）
- * @return EMDA_EOK=已入队
+ * @brief 发布一条上行数据
+ * @note  底层是数据模式：AT+MQTTPUB 后等 '>' 再送 payload
  */
-static int mqtt_connect(void)
+int app_mqtt_publish(const char *topic, const char *payload, uint16_t len)
 {
-    char cmd[EMDA_CMD_BUFFER_SIZE];
-    int n;
-
-    n = snprintf(cmd, sizeof(cmd),
-                 "AT+MQTTCONN=%d,\"%s\",%d,\"%s\",\"%s\",\"%s\"\r\n",
-                 APP_MQTT_ID, APP_MQTT_HOST, APP_MQTT_PORT,
-                 APP_MQTT_CLIENT_ID, APP_MQTT_USER, APP_MQTT_PASS);
-    if (n <= 0 || n >= (int)sizeof(cmd))
-    {
-        return EMDA_ENOMEM;
-    }
-
-    if (emda_device_exec(cmd, mqtt_conn_resp, APP_MQTT_CONN_TO_MS,
-                         mqtt_conn_timeout) != EMDA_EOK)
-    {
-        return EMDA_EBUSY;
-    }
-
-    s_mqtt_pending = 1;
-    s_last_conn_tick = emda_tick_get();
-    return EMDA_EOK;
+    return emda_ml307a_mqtt_publish(APP_MQTT_ID, topic,
+                                    (const uint8_t *)payload, len, 0);
 }
 
 /**
- * @brief 发布一条上行数据（QoS0，直接内联 payload）
+ * @brief MQTT 状态机：网络就绪后建链 -> 订阅 -> 掉线重连
  *
- * resp_cb 传 NULL 表示不关心响应内容：AT 核心收到模组第一条响应行即结束事务。
- */
-int app_mqtt_publish(const char *payload, uint16_t len)
-{
-    char cmd[EMDA_CMD_BUFFER_SIZE];
-    int n;
-
-    n = snprintf(cmd, sizeof(cmd), "AT+MQTTPUB=%d,\"%s\",0,0,0,%u,\"%s\"\r\n",
-                 APP_MQTT_ID, APP_MQTT_TOPIC_UP, (unsigned)len, payload);
-    if (n <= 0 || n >= (int)sizeof(cmd))
-    {
-        return EMDA_ENOMEM;
-    }
-
-    return emda_device_exec(cmd, NULL, APP_CMD_TIMEOUT_MS, NULL);
-}
-
-/**
- * @brief 业务侧状态机：网络就绪 + MQTT 掉线 -> 按间隔重连
- *
- * 放在 poll 循环里每轮调用，非阻塞。
+ * 非阻塞，放在 poll 循环里每轮调用。
  */
 static void mqtt_service(void)
 {
+    emda_tick_t now = emda_tick_get();
+    int connected;
+
     if (emda_net_state_get() != EMDA_NET_STATE_READY)
     {
         return;
     }
-    if (s_mqtt_connected || s_mqtt_pending)
+
+    connected = emda_ml307a_mqtt_connected(APP_MQTT_ID);
+
+    /* 连接状态发生 0 -> 1 变化：需要重新订阅 */
+    if (connected && !s_was_connected)
     {
-        return;
+        s_subscribed = 0;
+        s_last_probe_tick = now;
     }
-    if ((emda_tick_get() - s_last_conn_tick) < emda_tick_from_ms(APP_MQTT_RETRY_MS))
+    s_was_connected = connected;
+
+    if (!connected)
     {
+        if ((now - s_last_conn_tick) >= emda_tick_from_ms(APP_MQTT_RETRY_MS))
+        {
+            s_last_conn_tick = now;
+            (void)emda_ml307a_mqtt_connect(APP_MQTT_ID, APP_MQTT_HOST,
+                                           APP_MQTT_PORT, APP_MQTT_CLIENT_ID,
+                                           APP_MQTT_USER, APP_MQTT_PASS);
+        }
         return;
     }
 
-    (void)mqtt_connect();
+    /* 已连接：订阅一次 */
+    if (!s_subscribed)
+    {
+        if (emda_ml307a_mqtt_subscribe(APP_MQTT_ID, APP_MQTT_TOPIC_DOWN, 1) == EMDA_EOK)
+        {
+            s_subscribed = 1;
+        }
+    }
+
+    /* 已连接：低频查一次状态，兜底 URC 丢失 */
+    if ((now - s_last_probe_tick) >= emda_tick_from_ms(APP_MQTT_PROBE_MS))
+    {
+        s_last_probe_tick = now;
+        (void)emda_ml307a_mqtt_poll_state(APP_MQTT_ID);
+    }
 }
 
 /* ======================================================================== */
@@ -389,34 +306,42 @@ static void emda_task(void *arg)
 
     (void)arg;
 
-    /* 1. 绑定模组类 + 启动（内部完成串口初始化与状态阶梯注册） */
+    /* 1. 绑定模组类 + 启动（内部完成 0~4 步的状态阶梯） */
     if (emda_device_register(&emda_class_ml307a, NULL) != EMDA_EOK)
     {
         vTaskDelete(NULL);
         return;
     }
+
+    /*
+     * APN 必须在 start 之前设置：init 时才会插入 AT+CGDCONT 监控项。
+     * 默认不配置（走模组自动配置），需要时连同上面 APP_APN 一起打开。
+     */
+#if defined(APP_APN)
+    (void)emda_ml307a_set_apn(APP_APN);
+#endif
+
     if (emda_device_start() != EMDA_EOK)
     {
         vTaskDelete(NULL);
         return;
     }
 
-    /* 2. 追加应用层监控项（IP / MQTT 状态） */
+    /* 2. 追加应用层监控项（IP） */
     for (i = 0U; i < sizeof(s_app_monitors) / sizeof(s_app_monitors[0]); i++)
     {
         (void)emda_monitor_add(&s_app_monitors[i]);
     }
 
-    /* 3. 注册 MQTT URC（表满时调大 EMDA_URC_TABLE_SIZE） */
-    (void)emda_at_urc_attach(s_app_urc,
-                              (uint32_t)(sizeof(s_app_urc) / sizeof(s_app_urc[0])));
+    /* 3. 注册 MQTT 下行消息回调 */
+    emda_ml307a_mqtt_set_msg_cb(on_mqtt_msg);
 
     /* 4. 固定节拍驱动引擎 */
     last_wake = xTaskGetTickCount();
     for (;;)
     {
         emda_poll();     /* 收数据 + 解析 URC/响应 + 巡检调度 */
-        mqtt_service();  /* 业务侧连接状态机 */
+        mqtt_service();  /* 业务侧 MQTT 状态机 */
         emda_heartbeat();/* 一次 = EMDA_HEARTBEAT_PERIOD_MS */
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(EMDA_HEARTBEAT_PERIOD_MS));
@@ -439,7 +364,7 @@ void app_start(void)
 
 int app_mqtt_is_online(void)
 {
-    return s_mqtt_connected;
+    return emda_ml307a_mqtt_connected(APP_MQTT_ID);
 }
 
 const char *app_get_ip(void)

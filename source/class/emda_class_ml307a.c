@@ -6,7 +6,13 @@
  * 控制面状态阶梯(监控项驱动)：
  *
  *   UNKNOWN --ATE0--> INIT --AT+CPIN?--> REGISTERING --AT+CEREG?--> REGISTERED
- *           --AT+CGATT?--> READY --(CSQ/CEREG 巡检)--> LOST --AT--> INIT
+ *           --AT+CGATT?--> READY --(CSQ/CEREG/CPIN 巡检)--> LOST --AT--> INIT
+ *
+ * 运行期巡检覆盖三层，缺一层都会"看起来在线其实不能用"：
+ *   SIM  : AT+CPIN?   运行中被拔卡/卡失效 -> 回 INIT 重新爬梯
+ *   驻网 : AT+CEREG?  stat 0/2/4 -> LOST；stat 3(注册被拒) -> FAILED
+ *   信号 : AT+CSQ     rssi=99 表示无信号(寻网阶段也能判读)
+ *   FAILED 每 30s 用 AT 探活回 INIT，避免注册被拒后永久卡死。
  *
  * 数据面(普通接收模式 access_mode=0)：
  *   AT+MIPOPEN=<id>,"TCP",<addr>,<port>,60,0   ->  URC +MIPOPEN:<id>,0
@@ -27,6 +33,7 @@
 #include "emda_class_ml307a.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../emda_at.h"
@@ -47,6 +54,11 @@
 /* 单条 URC 允许的最大数据长度(手册: <send_length>/单包上限 1460) */
 #define ML307A_MAX_DATA_LEN      (1460)
 
+/* MQTT 单条消息上限(手册: ML307A <msg_len> 最大 1024) */
+#define ML307A_MQTT_MAX_PAYLOAD  (1024)
+#define ML307A_MQTT_CMD_TIMEOUT_MS (5000U)
+#define ML307A_MQTT_PUB_TIMEOUT_MS (15000U)
+
 /* ======================================================================== */
 /*                          内部状态                                          */
 /* ======================================================================== */
@@ -56,6 +68,9 @@ static int s_ber = 99;
 
 /* 当前在途的 socket 操作 */
 static int s_send_sock = -1;
+
+/* APN 配置命令(为空表示不配置，使用模组默认) */
+static char s_apn_cmd[96];
 
 /*
  * 建链请求可能排队(业务连续 create+connect 多路)，而 AT 事务串行执行，
@@ -171,13 +186,42 @@ static int ml307a_cpin_cb(uint8_t *buffer, uint16_t len)
     }
     if (strstr((const char *)buffer, "ERROR") != NULL)
     {
-        /* SIM 未插/未就绪：保持 INIT 继续重试，不把状态机打死 */
+        /*
+         * +CME ERROR: 10 = SIM 未插入, 11 = 需要 PIN, 13 = SIM 故障
+         * 保持 INIT 每 3s 重试，不推进也不打死状态机
+         */
+        EMDA_LOG("[ml307a] sim not ready\r\n");
         return EMDA_EOK;
     }
     return EMDA_ERROR;
 }
 
-/* 解析 +CEREG: <n>,<stat>，stat=1(本地)/5(漫游) 视为已驻网 */
+/* READY: SIM 巡检，检测运行期拔卡 */
+static int ml307a_cpin_poll_cb(uint8_t *buffer, uint16_t len)
+{
+    (void)len;
+    if (strstr((const char *)buffer, "+CPIN: READY") != NULL)
+    {
+        return EMDA_EOK;
+    }
+
+    /* 运行中卡被拔出/失效：退回 INIT 重新爬梯 */
+    EMDA_LOG("[ml307a] sim lost\r\n");
+    emda_net_state_set(EMDA_NET_STATE_INIT);
+    return EMDA_EOK;
+}
+
+/*
+ * 3GPP 27.007 的 <stat>：
+ *   1 本地注册  5 漫游注册  6/7 仅短信注册  9 CSFB not preferred
+ * 以上都表示"已驻网"，可以继续建链；0/2/4 是未注册，3 是被拒绝。
+ */
+static int s_cereg_registered(int stat)
+{
+    return (stat == 1 || stat == 5 || stat == 6 || stat == 7 || stat == 9) ? 1 : 0;
+}
+
+/* 解析 +CEREG: <n>,<stat> */
 static int ml307a_parse_cereg(const char *buffer, int *stat)
 {
     const char *p = strstr(buffer, "+CEREG:");
@@ -212,9 +256,19 @@ static int ml307a_cereg_cb(uint8_t *buffer, uint16_t len)
         return EMDA_ERROR;
     }
 
-    if (stat == 1 || stat == 5)
+    if (s_cereg_registered(stat))
     {
         emda_net_state_set(EMDA_NET_STATE_REGISTERED);
+    }
+    else if (stat == 3)
+    {
+        /* 注册被拒(SIM 欠费/无权限/APN 不符)：每 3s 重试没有意义，转 FAILED 慢速重试 */
+        EMDA_LOG("[ml307a] registration denied\r\n");
+        emda_net_state_set(EMDA_NET_STATE_FAILED);
+    }
+    else
+    {
+        EMDA_LOG("[ml307a] registering, stat=%d\r\n", stat);
     }
     return EMDA_EOK;
 }
@@ -272,8 +326,19 @@ static int ml307a_cereg_poll_cb(uint8_t *buffer, uint16_t len)
         return EMDA_ERROR;
     }
 
-    if (stat != 1 && stat != 5)
+    if (s_cereg_registered(stat))
     {
+        return EMDA_EOK;
+    }
+
+    if (stat == 3)
+    {
+        EMDA_LOG("[ml307a] registration denied\r\n");
+        emda_net_state_set(EMDA_NET_STATE_FAILED);
+    }
+    else
+    {
+        EMDA_LOG("[ml307a] network lost, stat=%d\r\n", stat);
         emda_net_state_set(EMDA_NET_STATE_LOST);
     }
     return EMDA_EOK;
@@ -291,9 +356,51 @@ static int ml307a_relost_cb(uint8_t *buffer, uint16_t len)
     return EMDA_ERROR;
 }
 
+/* FAILED: 慢速重试，避免因注册被拒而永久卡死 */
+static int ml307a_recover_cb(uint8_t *buffer, uint16_t len)
+{
+    (void)len;
+    if (strstr((const char *)buffer, "OK") != NULL)
+    {
+        emda_net_state_set(EMDA_NET_STATE_INIT);
+        return EMDA_EOK;
+    }
+    return EMDA_ERROR;
+}
+
 /* ======================================================================== */
 /*                          控制面：模组初始化                                */
 /* ======================================================================== */
+
+/**
+ * @brief 配置 PDP 上下文 APN（可选）
+ *
+ * 手册：第 1 路是默认承载，模组自动配置，手工配置掉电不保存。
+ * 公网卡不用配；物联网卡(CMIOT)或私有 APN 必须每次开机重配一次。
+ */
+int emda_ml307a_set_apn(const char *apn)
+{
+    if (apn == NULL || apn[0] == '\0' || strlen(apn) > 32U)
+    {
+        return EMDA_EINVAL;
+    }
+
+    (void)snprintf(s_apn_cmd, sizeof(s_apn_cmd),
+                   "AT+CGDCONT=1,\"IPV4V6\",\"%s\"\r\n", apn);
+    return EMDA_EOK;
+}
+
+static int ml307a_cgdcont_cb(uint8_t *buffer, uint16_t len)
+{
+    (void)len;
+
+    if (strstr((const char *)buffer, "OK") != NULL)
+    {
+        EMDA_LOG("[ml307a] apn configured\r\n");
+        return EMDA_EOK;
+    }
+    return EMDA_ERROR;
+}
 
 /**
  * @brief 注册监控项(状态阶梯) + URC 回调
@@ -331,6 +438,16 @@ static int ml307a_init(emda_device_t *dev)
             .timeout_ms = 2000U,
         },
         {
+            /* 寻网阶段同时看信号：rssi=99 说明根本没信号，不是"还在搜网" */
+            .name = "csq_search",
+            .cmd = "AT+CSQ\r\n",
+            .state = EMDA_NET_STATE_REGISTERING,
+            .interval_ms = 10000U,
+            .resp_cb = ml307a_csq_cb,
+            .timeout_cb = ml307a_timeout_cb,
+            .timeout_ms = 2000U,
+        },
+        {
             /* 已驻网后再确认 GPRS 附着，就可进入 READY 建链 */
             .name = "cgatt",
             .cmd = "AT+CGATT?\r\n",
@@ -361,6 +478,16 @@ static int ml307a_init(emda_device_t *dev)
             .timeout_ms = 2000U,
         },
         {
+            /* 运行期巡检：SIM 是否还在(拔卡/卡失效要能发现) */
+            .name = "cpin_poll",
+            .cmd = "AT+CPIN?\r\n",
+            .state = EMDA_NET_STATE_READY,
+            .interval_ms = 60000U,
+            .resp_cb = ml307a_cpin_poll_cb,
+            .timeout_cb = ml307a_timeout_cb,
+            .timeout_ms = 2000U,
+        },
+        {
             /* 掉网后重新探测模组，回到 INIT 重新爬梯 */
             .name = "relost",
             .cmd = "AT\r\n",
@@ -370,9 +497,44 @@ static int ml307a_init(emda_device_t *dev)
             .timeout_cb = ml307a_timeout_cb,
             .timeout_ms = 1000U,
         },
+        {
+            /* 注册被拒后不频繁重试，30s 回 INIT 重新爬梯 */
+            .name = "recover",
+            .cmd = "AT\r\n",
+            .state = EMDA_NET_STATE_FAILED,
+            .interval_ms = 30000U,
+            .resp_cb = ml307a_recover_cb,
+            .timeout_cb = ml307a_timeout_cb,
+            .timeout_ms = 1000U,
+        },
     };
 
     (void)dev;
+
+    /*
+     * APN 项必须排在 cpin 之前：两者都只在 INIT 状态调度，而调度器在"同样最久
+     * 未执行"时取表中靠前的那条。cpin 一旦成功就把状态推到 REGISTERING，
+     * 排在后面的 APN 项就永远轮不到了。
+     * 间隔给一天，效果等同"每次开机跑一次"。
+     */
+    if (s_apn_cmd[0] != '\0')
+    {
+        emda_monitor_t apn_item = {
+            .name = "cgdcont",
+            .cmd = s_apn_cmd,
+            .state = EMDA_NET_STATE_INIT,
+            .interval_ms = 86400000U,
+            .resp_cb = ml307a_cgdcont_cb,
+            .timeout_cb = ml307a_timeout_cb,
+            .timeout_ms = 3000U,
+        };
+
+        if (emda_monitor_add(&apn_item) != EMDA_EOK)
+        {
+            EMDA_LOG("[ml307a] monitor table full (apn)\r\n");
+            return EMDA_ENOMEM;
+        }
+    }
 
     for (uint32_t i = 0U; i < sizeof(s_items) / sizeof(s_items[0]); i++)
     {
@@ -598,6 +760,209 @@ static int ml307a_sock_close(emda_device_t *dev, int sock)
 }
 
 /* ======================================================================== */
+/*                          MQTT 接口                                        */
+/* ======================================================================== */
+/*
+ * 连接流程（手册 MQTT 用户手册 3.2/3.3/3.5）：
+ *   1. AT+MQTTCONN=<id>,"host",<port>,"clientid","user","pass"  -> OK
+ *      真正的结果由 URC 上报：+MQTTURC: "conn",<id>,0 才是连上
+ *   2. AT+MQTTSUB=<id>,"topic",<qos>  -> +MQTTSUB: <id>,<mid> + OK
+ *      订阅结果：+MQTTURC: "suback",<id>,<mid>,<code>
+ *   3. AT+MQTTPUB=<id>,"topic",<qos>,0,0,<len>  -> '>' -> payload
+ *                                                  -> +MQTTPUB: <id>,<mid>,<len> + OK
+ *
+ * 注意：MQTTCFG/SUB/PUB 的响应前缀(+MQTTSUB:/+MQTTPUB:)不能注册成 URC，
+ *       否则会被 URC 抢走、resp_cb 收不到 OK。
+ */
+
+static volatile int s_mqtt_connected[EMDA_ML307A_MQTT_MAX];
+static emda_ml307a_mqtt_msg_cb_t s_mqtt_msg_cb = NULL;
+
+/* 主动查询状态时记录 cid（AT+MQTTSTATE 的响应里没有 cid） */
+static int s_mqtt_poll_cid = -1;
+
+static int s_mqtt_cid_valid(int cid)
+{
+    return (cid >= 0 && cid < EMDA_ML307A_MQTT_MAX) ? 1 : 0;
+}
+
+void emda_ml307a_mqtt_set_msg_cb(emda_ml307a_mqtt_msg_cb_t cb)
+{
+    s_mqtt_msg_cb = cb;
+}
+
+int emda_ml307a_mqtt_connected(int cid)
+{
+    if (!s_mqtt_cid_valid(cid))
+    {
+        return 0;
+    }
+    return s_mqtt_connected[cid];
+}
+
+/* 通用命令响应：OK / ERROR 都算"事务结束"，具体结果看 URC */
+static int s_mqtt_cmd_resp(uint8_t *buffer, uint16_t len)
+{
+    (void)len;
+    if (strstr((const char *)buffer, "OK") != NULL)
+    {
+        return EMDA_EOK;
+    }
+    if (strstr((const char *)buffer, "ERROR") != NULL)
+    {
+        return EMDA_EOK;
+    }
+    return EMDA_ERROR;
+}
+
+static int s_mqtt_cmd_timeout(char *cmd)
+{
+    EMDA_LOG("[ml307a] mqtt timeout: %s", (cmd != NULL) ? cmd : "?");
+    return EMDA_EOK;
+}
+
+/* +MQTTSTATE: <1连接中|2成功|3断开> */
+static int s_mqtt_state_resp(uint8_t *buffer, uint16_t len)
+{
+    const char *p = strstr((const char *)buffer, "+MQTTSTATE:");
+
+    (void)len;
+
+    if (p == NULL)
+    {
+        return EMDA_ERROR;
+    }
+    if (s_mqtt_cid_valid(s_mqtt_poll_cid))
+    {
+        s_mqtt_connected[s_mqtt_poll_cid] = (atoi(p + 11) == 2) ? 1 : 0;
+    }
+    return EMDA_EOK;
+}
+
+int emda_ml307a_mqtt_connect(int cid, const char *host, uint16_t port,
+                             const char *client_id,
+                             const char *user, const char *pass)
+{
+    char cmd[EMDA_CMD_BUFFER_SIZE];
+    int n;
+
+    if (!s_mqtt_cid_valid(cid) || host == NULL || client_id == NULL)
+    {
+        return EMDA_EINVAL;
+    }
+
+    if (user != NULL)
+    {
+        n = snprintf(cmd, sizeof(cmd),
+                     "AT+MQTTCONN=%d,\"%s\",%u,\"%s\",\"%s\",\"%s\"\r\n",
+                     cid, host, (unsigned)port, client_id, user,
+                     (pass != NULL) ? pass : "");
+    }
+    else
+    {
+        n = snprintf(cmd, sizeof(cmd), "AT+MQTTCONN=%d,\"%s\",%u,\"%s\"\r\n",
+                     cid, host, (unsigned)port, client_id);
+    }
+    if (n <= 0 || n >= (int)sizeof(cmd))
+    {
+        return EMDA_ENOMEM;
+    }
+
+    return emda_at_submit(cmd, s_mqtt_cmd_resp, ML307A_MQTT_CMD_TIMEOUT_MS,
+                          s_mqtt_cmd_timeout);
+}
+
+int emda_ml307a_mqtt_subscribe(int cid, const char *topic, int qos)
+{
+    char cmd[EMDA_CMD_BUFFER_SIZE];
+    int n;
+
+    if (!s_mqtt_cid_valid(cid) || topic == NULL || qos < 0 || qos > 2)
+    {
+        return EMDA_EINVAL;
+    }
+
+    n = snprintf(cmd, sizeof(cmd), "AT+MQTTSUB=%d,\"%s\",%d\r\n", cid, topic, qos);
+    if (n <= 0 || n >= (int)sizeof(cmd))
+    {
+        return EMDA_ENOMEM;
+    }
+
+    return emda_at_submit(cmd, s_mqtt_cmd_resp, ML307A_MQTT_CMD_TIMEOUT_MS,
+                          s_mqtt_cmd_timeout);
+}
+
+int emda_ml307a_mqtt_publish(int cid, const char *topic,
+                             const uint8_t *payload, uint16_t len, int qos)
+{
+    char cmd[EMDA_CMD_BUFFER_SIZE];
+    int n;
+
+    if (!s_mqtt_cid_valid(cid) || topic == NULL || payload == NULL ||
+        len == 0U || qos < 0 || qos > 2)
+    {
+        return EMDA_EINVAL;
+    }
+    if (len > ML307A_MQTT_MAX_PAYLOAD)
+    {
+        return EMDA_ENOMEM;
+    }
+
+    /* 省略 <message> 进入数据模式，收到 '>' 后送原始 payload */
+    n = snprintf(cmd, sizeof(cmd), "AT+MQTTPUB=%d,\"%s\",%d,0,0,%u\r\n",
+                 cid, topic, qos, (unsigned)len);
+    if (n <= 0 || n >= (int)sizeof(cmd))
+    {
+        return EMDA_ENOMEM;
+    }
+
+    return emda_at_submit_raw(cmd, ">", payload, len,
+                              s_mqtt_cmd_resp, ML307A_MQTT_PUB_TIMEOUT_MS,
+                              s_mqtt_cmd_timeout);
+}
+
+int emda_ml307a_mqtt_disconnect(int cid)
+{
+    char cmd[EMDA_CMD_BUFFER_SIZE];
+    int n;
+
+    if (!s_mqtt_cid_valid(cid))
+    {
+        return EMDA_EINVAL;
+    }
+
+    n = snprintf(cmd, sizeof(cmd), "AT+MQTTDISC=%d\r\n", cid);
+    if (n <= 0 || n >= (int)sizeof(cmd))
+    {
+        return EMDA_ENOMEM;
+    }
+
+    return emda_at_submit(cmd, s_mqtt_cmd_resp, ML307A_MQTT_CMD_TIMEOUT_MS,
+                          s_mqtt_cmd_timeout);
+}
+
+int emda_ml307a_mqtt_poll_state(int cid)
+{
+    char cmd[EMDA_CMD_BUFFER_SIZE];
+    int n;
+
+    if (!s_mqtt_cid_valid(cid))
+    {
+        return EMDA_EINVAL;
+    }
+
+    n = snprintf(cmd, sizeof(cmd), "AT+MQTTSTATE=%d\r\n", cid);
+    if (n <= 0 || n >= (int)sizeof(cmd))
+    {
+        return EMDA_ENOMEM;
+    }
+
+    s_mqtt_poll_cid = cid;
+    return emda_at_submit(cmd, s_mqtt_state_resp, ML307A_MQTT_CMD_TIMEOUT_MS,
+                          s_mqtt_cmd_timeout);
+}
+
+/* ======================================================================== */
 /*                          URC 处理                                          */
 /* ======================================================================== */
 /*
@@ -816,9 +1181,200 @@ static int s_urc_mipurc_other(const uint8_t *data, uint16_t len)
     return EMDA_EOK;
 }
 
+/* ---- MQTT 下行消息 ---- */
+/*
+ * +MQTTURC: "publish",<id>,<mid>,<topic>,<total_len>,<payload_len>,<payload>
+ * 第二个数字是 <mid>（报文标识），不是 QoS；topic 带引号，payload 可能是二进制。
+ */
+#define ML307A_MQTT_PUB_PREFIX_LEN (20U) /* strlen("+MQTTURC: \"publish\",") */
+
+static int s_mqtt_publish_seg_len(const uint8_t *buf, uint16_t avail)
+{
+    uint16_t pos = ML307A_MQTT_PUB_PREFIX_LEN;
+    int id = 0;
+    int mid = 0;
+    int total = 0;
+    int payload_len = 0;
+    int ret;
+
+    ret = s_read_field(buf, avail, &pos, &id, 1);
+    if (ret == EMDA_ETIMEOUT)
+    {
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
+    }
+
+    ret = s_read_field(buf, avail, &pos, &mid, 1);
+    if (ret == EMDA_ETIMEOUT)
+    {
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
+    }
+
+    /* topic: "..." */
+    if (pos >= avail)
+    {
+        return 0;
+    }
+    if (buf[pos] != '"')
+    {
+        return -1;
+    }
+    pos++;
+    while (pos < avail && buf[pos] != '"')
+    {
+        pos++;
+    }
+    if (pos >= avail)
+    {
+        return 0; /* topic 还没收全 */
+    }
+    pos++;
+    if (pos >= avail)
+    {
+        return 0;
+    }
+    if (buf[pos] != ',')
+    {
+        return -1;
+    }
+    pos++;
+
+    ret = s_read_field(buf, avail, &pos, &total, 1);
+    if (ret == EMDA_ETIMEOUT)
+    {
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
+    }
+
+    ret = s_read_field(buf, avail, &pos, &payload_len, 1);
+    if (ret == EMDA_ETIMEOUT)
+    {
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
+    }
+
+    if (payload_len < 0 || payload_len > ML307A_MQTT_MAX_PAYLOAD)
+    {
+        return -1;
+    }
+
+    return (int)pos + payload_len;
+}
+
+static int s_urc_mqtt_publish(const uint8_t *data, uint16_t len)
+{
+    uint16_t pos = ML307A_MQTT_PUB_PREFIX_LEN;
+    uint16_t topic_start;
+    uint16_t topic_len;
+    int id = 0;
+    int mid = 0;
+    int total = 0;
+    int payload_len = 0;
+    char topic[64];
+
+    if (s_read_field(data, len, &pos, &id, 1) != EMDA_EOK ||
+        s_read_field(data, len, &pos, &mid, 1) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+
+    if (pos >= len || data[pos] != '"')
+    {
+        return EMDA_ERROR;
+    }
+    pos++;
+    topic_start = pos;
+    while (pos < len && data[pos] != '"')
+    {
+        pos++;
+    }
+    topic_len = (uint16_t)(pos - topic_start);
+    if (pos >= len)
+    {
+        return EMDA_ERROR;
+    }
+    pos++;
+    if (pos >= len || data[pos] != ',')
+    {
+        return EMDA_ERROR;
+    }
+    pos++;
+
+    if (s_read_field(data, len, &pos, &total, 1) != EMDA_EOK ||
+        s_read_field(data, len, &pos, &payload_len, 1) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+    if (payload_len < 0 ||
+        (uint32_t)pos + (uint32_t)payload_len > (uint32_t)len)
+    {
+        return EMDA_ERROR;
+    }
+
+    if (topic_len >= sizeof(topic))
+    {
+        topic_len = (uint16_t)(sizeof(topic) - 1U);
+    }
+    memcpy(topic, &data[topic_start], topic_len);
+    topic[topic_len] = '\0';
+
+    if (s_mqtt_msg_cb != NULL)
+    {
+        s_mqtt_msg_cb(id, topic, &data[pos], (uint16_t)payload_len);
+    }
+    return EMDA_EOK;
+}
+
+/* ---- 其它 MQTT URC：conn / suback / puback / drop / timeout ---- */
+static int s_urc_mqtt_other(const uint8_t *data, uint16_t len)
+{
+    /* +MQTTURC: "conn",<id>,<conn_state> */
+    if (len >= 17U && memcmp(data, "+MQTTURC: \"conn\",", 17U) == 0)
+    {
+        uint16_t pos = 17U;
+        int id = 0;
+        int state = -1;
+
+        if (s_read_field(data, len, &pos, &id, 1) != EMDA_EOK ||
+            s_read_field(data, len, &pos, &state, 0) != EMDA_EOK)
+        {
+            return EMDA_ERROR;
+        }
+
+        if (!s_mqtt_cid_valid(id))
+        {
+            return EMDA_ERROR;
+        }
+
+        /* 0=连接成功，其余(1重连/2用户断开/3被拒/4服务器断开/5Ping超时/6网络异常)都算断开 */
+        s_mqtt_connected[id] = (state == 0) ? 1 : 0;
+        EMDA_LOG("[ml307a] mqtt conn id=%d state=%d\r\n", id, state);
+        return EMDA_EOK;
+    }
+
+    /* suback / unsuback / puback / drop / timeout：交给业务日志观察即可 */
+    EMDA_LOG("[ml307a] mqtt urc\r\n");
+    return EMDA_EOK;
+}
+
 /* ---- URC 表 ---- */
 
 static const emda_urc_t s_ml307a_urc[] = {
+    {"+MQTTURC: \"publish\",", s_mqtt_publish_seg_len, s_urc_mqtt_publish},
+    {"+MQTTURC:", NULL, s_urc_mqtt_other},
     {"+MIPURC: \"rtcp\",", s_rtcp_seg_len, s_rtcp_payload},
     {"+MIPURC: \"rudp\",", s_rtcp_seg_len, s_rtcp_payload},
     {"+MIPOPEN:", NULL, s_urc_mipopen},

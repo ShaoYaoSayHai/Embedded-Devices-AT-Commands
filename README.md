@@ -171,8 +171,18 @@ ML307A 的状态阶梯（全部由监控项驱动，没有一行阻塞代码）�
 
 ```
 UNKNOWN --ATE0--> INIT --AT+CPIN?--> REGISTERING --AT+CEREG?--> REGISTERED
-        --AT+CGATT?--> READY --(CSQ/CEREG 巡检)--> LOST --AT--> INIT
+        --AT+CGATT?--> READY --(CSQ/CEREG/CPIN 巡检)--> LOST --AT--> INIT
+                                    |
+                                    +--stat=3(注册被拒)--> FAILED --AT(30s)--> INIT
 ```
+
+运行期巡检必须同时覆盖 SIM / 驻网 / 信号三层，只查其中一层会出现“状态是 READY 但发不出数据”：
+
+| 巡检项 | 指令 | 间隔 | 判据 |
+| --- | --- | --- | --- |
+| SIM | `AT+CPIN?` | 60s | 非 `+CPIN: READY` → 回 INIT |
+| 驻网 | `AT+CEREG?` | 30s | stat 0/2/4 → LOST；stat 3 → FAILED；1/5/6/7/9 正常 |
+| 信号 | `AT+CSQ` | 30s | `rssi=99` 表示不可检测 |
 
 数据面命令依据 `document/ML307A/` 手册：
 
@@ -182,6 +192,59 @@ AT+MIPSEND=<id>,<len>  ->  ">"  ->  原始数据  ->  +MIPSEND / OK
 AT+MIPCLOSE=<id>                           ->  OK / URC +MIPCLOSE:<id>
 收到数据: +MIPURC: "rtcp",<id>,<len>,<data>
 ```
+
+MQTT 由模组内置协议栈提供（`AT+MQTT*`），与 socket 层并行：
+
+```
+AT+MQTTCONN=<id>,"host",<port>,"clientid","user","pass"  -> OK
+                                                          -> URC +MQTTURC: "conn",<id>,0  才算连上
+AT+MQTTSUB=<id>,"topic",<qos>      -> +MQTTSUB: <id>,<mid> + OK
+                                      -> URC +MQTTURC: "suback",<id>,<mid>,<code>
+AT+MQTTPUB=<id>,"topic",<qos>,0,0,<len>  -> ">" -> payload -> +MQTTPUB: <id>,<mid>,<len> + OK
+下行: +MQTTURC: "publish",<id>,<mid>,<topic>,<total_len>,<payload_len>,<payload>
+断开: AT+MQTTDISC=<id>             -> OK + URC +MQTTURC: "conn",<id>,2
+```
+
+三处容易记错的点：
+
+- `+MQTTURC: "conn"` 的 `<conn_state>` 是 **0 成功 / 1 重连 / 2 用户断开 / 3 被拒 / 4 服务器断开 / 5 Ping 超时 / 6 网络异常**；
+  而 `AT+MQTTSTATE` 返回的是 **1 连接中 / 2 成功 / 3 断开**，两套编号不能共用解析。
+- 没有 `+MQTTURC: "disconn"`，断开是通过 `"conn"` 的 `2/3/4/5/6` 上报。
+- `"publish"` 的第二个数字是 `<mid>`（报文标识），不是 QoS。
+
+**PDP 相关**：`AT+CGACT` 指令本身是存在的（AT 指令手册 7.4），但 ML307A 走应用层自动拨号，
+《通信流程示例》里明确写了三条约束：
+
+- "由于自动拨号模式下模组底层逻辑影响，**不建议使用 AT+CGACT 进行 PDP 激活与去激活操作**"；
+- "第 1 路为默认承载，模组会自动配置，不需使用 AT+CGDCONT 来配置"；
+- "模组必须保持至少有 1 路 PDP 处于激活状态……建议使用 AT+CFUN=4 去激活 PDP"。
+
+所以本库的阶梯里只用 `AT+CGATT?` 判断 PS 附着，用 `AT+MIPCALL?` 判断是否真的拨号拿到 IP
+（`+MIPCALL: <cid>,<state>,"<ipv4>"[,"<ipv6>"]`，`state=1` 才算通）。标准 3GPP 的
+`AT+CGPADDR=<cid>` 也能查到地址，但 ML307A 的拨号状态以 `MIPCALL` 为准。
+
+需要手工断网时用 `AT+MIPCALL=0,<cid>`（注意它只断连接、不去激活 PDP）；要彻底去激活用 `AT+CFUN=4`。
+
+### ML307A 常用指令与本库的对应关系
+
+| 指令 | 作用 | 本库怎么用 |
+| --- | --- | --- |
+| `ATE0` | 关闭回显 | 模组类在 UNKNOWN 状态自动下发 |
+| `ATE1` | 打开回显 | 不使用（回显会污染响应解析） |
+| `AT+CPIN?` | SIM 状态 | INIT 巡检 + READY 60s 巡检 |
+| `AT+CSQ` | 信号强度 | REGISTERING / READY 巡检 |
+| `AT+CEREG?` | 驻网（EPS 域） | REGISTERING → REGISTERED，READY 30s 巡检 |
+| `AT+COPS?` | 运营商 | 仅诊断用，不参与状态推进（数据业务以 CEREG 为准） |
+| `AT+CGDCONT` | 定义 PDP 上下文 / APN | 选择性：`emda_ml307a_set_apn("CMIOT")`，INIT 阶段下发一次；公网卡 / eSIM 公网 profile 一般不需要 |
+| `AT+CGATT?` | PS 附着 | REGISTERED → READY 的判据 |
+| `AT+CGACT` | 激活/去激活 PDP | **不使用**（自动拨号模式下不建议，见上） |
+| `AT+MIPCALL?` | 模组应用层拨号状态 | 取 IP：`+MIPCALL: <cid>,<state>,"<ipv4>"` |
+| `AT+MDIALUP` | 给上位机（USB 网卡）拨号 | **不使用**：那是 RNDIS/ECM 网卡模式，本库走模组内部协议栈 |
+| `AT+MDIALUPCFG` | 网卡拨号协议配置 | 同上 |
+| `AT+MUESTATS="radio"` | 服务小区/RSSI/RSRP 详情 | 未内置；需要更细的信号诊断时可自行 `emda_device_exec()` |
+
+`MDIALUP` 和 `MIPCALL` 是最容易混的一对：模组内部 socket/MQTT 走 `MIPCALL`，
+只有把模组当 USB 网卡、由 MCU/PC 自己的 TCP-IP 栈上网时才用 `MDIALUP`。
 
 ---
 
@@ -285,6 +348,18 @@ AT 核心先发指令，在接收缓冲里发现提示符后立刻把原始数�
 | `emda_socket_recv(sock, buf, len)` | 从接收缓冲取数据（不阻塞） |
 | `emda_socket_close(sock)` | 关闭连接 |
 | `emda_socket_state_get(sock)` | 查询状态 |
+
+### 模组类 MQTT（ML307A 内置协议栈）
+
+| API | 说明 |
+| --- | --- |
+| `emda_ml307a_mqtt_connect(cid, host, port, client_id, user, pass)` | 建链（异步，`conn` URC 才是结果） |
+| `emda_ml307a_mqtt_subscribe(cid, topic, qos)` | 订阅（`suback` URC 上报结果） |
+| `emda_ml307a_mqtt_publish(cid, topic, payload, len, qos)` | 发布（内部走 `>` 数据模式） |
+| `emda_ml307a_mqtt_disconnect(cid)` | 主动断开（收到 `conn,<id>,2`） |
+| `emda_ml307a_mqtt_connected(cid)` | 本地维护的连接状态（由 `conn` URC 更新） |
+| `emda_ml307a_mqtt_poll_state(cid)` | 主动查 `AT+MQTTSTATE`，URC 丢失时兜底 |
+| `emda_ml307a_mqtt_set_msg_cb(cb)` | 注册下行消息回调，payload 按长度处理 |
 
 ### AT 核心（一般业务不直接用）
 
