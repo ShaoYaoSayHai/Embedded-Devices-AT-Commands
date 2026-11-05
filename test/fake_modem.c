@@ -40,6 +40,9 @@ static uint8_t s_payload[MODEM_PAY_SIZE];
 /* 心跳 */
 static volatile emda_tick_t s_tick = 0U;
 
+/* 单次读返回上限(模拟 DMA 分片)，0 = 不限 */
+static uint16_t s_read_limit = 0U;
+
 /* ======================================================================== */
 /*                              内部工具                                     */
 /* ======================================================================== */
@@ -169,6 +172,12 @@ void fake_modem_reset(void)
     s_payload_need = 0;
     s_payload_got = 0;
     s_tick = 0U;
+    s_read_limit = 0U;
+}
+
+void fake_modem_set_read_limit(uint16_t limit)
+{
+    s_read_limit = limit;
 }
 
 void fake_modem_inject(const char *text)
@@ -178,12 +187,17 @@ void fake_modem_inject(const char *text)
 
 void fake_modem_inject_data(int id, const char *data)
 {
+    fake_modem_inject_data_bin(id, (const uint8_t *)data, (uint16_t)strlen(data));
+}
+
+void fake_modem_inject_data_bin(int id, const uint8_t *data, uint16_t len)
+{
     char head[48];
 
     (void)snprintf(head, sizeof(head), "+MIPURC: \"rtcp\",%d,%u,",
-                   id, (unsigned)strlen(data));
+                   id, (unsigned)len);
     modem_write(head);
-    modem_write_raw(data, (uint16_t)strlen(data));
+    modem_write_raw((const char *)data, len);
     modem_write("\r\n");
 }
 
@@ -283,35 +297,34 @@ int emda_port_uart_send(const uint8_t *data, uint16_t len)
     return EMDA_EOK;
 }
 
-int emda_port_uart_read_frame(uint8_t *out_buf,
-                              uint16_t buf_size,
-                              uint16_t *out_frame_len,
-                              uint32_t timeout_ms)
+int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms)
 {
     uint16_t n;
 
     (void)timeout_ms;
 
-    if (out_buf == NULL || out_frame_len == NULL)
+    if (buf == NULL || size == 0U)
     {
         return EMDA_EINVAL;
     }
-    *out_frame_len = 0U;
-
     if (s_out_len == 0U)
     {
-        return EMDA_ETIMEOUT;
+        return 0;
     }
 
-    n = (s_out_len < buf_size) ? s_out_len : buf_size;
-    memcpy(out_buf, s_out, n);
+    n = (s_out_len < size) ? s_out_len : size;
+    if (s_read_limit != 0U && n > s_read_limit)
+    {
+        n = s_read_limit; /* 模拟 DMA 分片：一次只给这么多 */
+    }
+
+    memcpy(buf, s_out, n);
     s_out_len = (uint16_t)(s_out_len - n);
     if (s_out_len > 0U)
     {
         memmove(s_out, &s_out[n], s_out_len);
     }
-    *out_frame_len = n;
-    return EMDA_EOK;
+    return (int)n;
 }
 
 void emda_port_enter_critical(void) { }

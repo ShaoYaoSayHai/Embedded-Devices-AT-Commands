@@ -67,9 +67,27 @@
 #define EMDA_CMD_BUFFER_SIZE (256U)
 #endif
 
-/* AT响应接收窗口缓冲区(一次接收窗口聚合的最大数据量) */
-#ifndef EMDA_RX_WINDOW_BUFFER_SIZE
-#define EMDA_RX_WINDOW_BUFFER_SIZE (1024U)
+/*
+ * 串口接收环形缓冲。
+ * 必须能装下「模组单条最长 URC」的完整一段(header + 裸数据 + 尾部)：
+ *   ML307A 单条 +MIPURC 最大 1460 字节数据 + ~20 字节 header，给 2048 足够。
+ * 调小可省 RAM，但超过该长度的 URC 会被丢弃并重新同步。
+ */
+#ifndef EMDA_RX_BUFFER_SIZE
+#define EMDA_RX_BUFFER_SIZE (2048U)
+#endif
+
+/*
+ * 单条 AT 响应的累积文本缓冲(多行响应首尾相接，供回调 strstr 整体匹配)。
+ * 只承载文本，二进制数据走 URC 的 payload 段，不经过这里。
+ */
+#ifndef EMDA_RESP_BUFFER_SIZE
+#define EMDA_RESP_BUFFER_SIZE (1024U)
+#endif
+
+/* 每次 emda_at_poll 最多从串口读几批数据(防止单次轮询被收数据占满) */
+#ifndef EMDA_RX_READS_PER_POLL
+#define EMDA_RX_READS_PER_POLL (4U)
 #endif
 
 /*
@@ -126,14 +144,12 @@
  * 以下参数都是「时间戳判断」，不是延时。移植者仍需高频调用 emda_poll()，
  * 引擎内部按这些参数控制实际节奏。
  *
- *   EMDA_RX_WINDOW_MS     - 无明确文本边界(CRLF)时的帧间静默兜底时间
  *   EMDA_RESP_COOLDOWN_MS - RESP_OK 后限制下一条发送的冷却；不暂停 RX/URC
  *   EMDA_LOOP_INTERVAL_MS - AT状态机最小推进间隔(0=每次都跑)
+ *
+ * 注意：接收侧已不再依赖时间窗判断边界——完全由「URC 前缀/长度」和
+ *       「文本行 CRLF」定界，见 emda_at.c 的 s_rx_parse()。
  */
-
-#ifndef EMDA_RX_WINDOW_MS
-#define EMDA_RX_WINDOW_MS (20U)
-#endif
 
 #ifndef EMDA_RESP_COOLDOWN_MS
 #define EMDA_RESP_COOLDOWN_MS (50U)
@@ -148,7 +164,7 @@
 #define EMDA_AT_DEFAULT_TIMEOUT_MS (2000U)
 #endif
 
-/* 串口读帧默认超时(ms) */
+/* 串口读取默认超时(ms)，供需要阻塞读的移植实现使用 */
 #ifndef EMDA_UART_READ_TIMEOUT_MS
 #define EMDA_UART_READ_TIMEOUT_MS (10U)
 #endif

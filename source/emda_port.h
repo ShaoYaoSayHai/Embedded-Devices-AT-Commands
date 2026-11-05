@@ -5,7 +5,7 @@
  *
  * port 层只有 4 类接口，无任务管理：
  *   1. 心跳时间：emda_heartbeat / emda_tick_get / emda_tick_from_ms
- *   2. 串口收发：emda_port_uart_init / send / read_frame
+ *   2. 串口收发：emda_port_uart_init / uart_send / uart_read(纯字节流)
  *   3. 临界区  ：emda_port_enter_critical / exit_critical
  *   4. 互斥锁  ：emda_port_mutex_create / destroy / lock / unlock
  *
@@ -81,18 +81,19 @@ int emda_port_uart_init(void);
 int emda_port_uart_send(const uint8_t *data, uint16_t len);
 
 /**
- * @brief 串口读取一帧数据(带超时)
- *         底层通常对接 DMA+空闲中断 或 环形缓冲区
- * @param out_buf        输出缓冲区
- * @param buf_size       缓冲区容量
- * @param out_frame_len  实际读到的帧长度
- * @param timeout_ms     超时时间(ms)，0=非阻塞立即返回
- * @return EMDA_EOK=读到数据, EMDA_ETIMEOUT=无数据, EMDA_EIO=错误
+ * @brief 串口读取「当前可用的任意字节」——纯字节流，不定义帧
+ *
+ * 重要约定：本接口不负责切帧。不要按 CRLF、不要按 DMA 空闲、不要按任何
+ * AT 语义分片，有多少给多少即可；消息边界全部由 emda_at.c 负责判定。
+ *
+ * 典型实现：DMA + 空闲中断维护一个字节 FIFO，本函数把 FIFO 里的数据搬出去。
+ *
+ * @param buf        输出缓冲区
+ * @param size       缓冲区容量
+ * @param timeout_ms 0 = 非阻塞立即返回；>0 = 最多等待这么久
+ * @return >0 实际读到的字节数；0 当前无数据；<0 错误(EMDA_EIO)
  */
-int emda_port_uart_read_frame(uint8_t *out_buf,
-                              uint16_t buf_size,
-                              uint16_t *out_frame_len,
-                              uint32_t timeout_ms);
+int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms);
 
 /* ======================================================================== */
 /*                          3. 临界区接口                                    */

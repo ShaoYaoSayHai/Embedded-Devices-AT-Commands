@@ -53,10 +53,9 @@ emda_tick_t emda_tick_from_ms(uint32_t ms)
  *              ? EMDA_EOK : EMDA_EIO;
  *   }
  *
- *   int emda_port_uart_read_frame(uint8_t *out_buf, uint16_t buf_size,
- *                                 uint16_t *out_frame_len, uint32_t timeout_ms) {
- *       // 从空闲中断/RingBuffer 取一帧，拷贝到 out_buf
- *       return EMDA_EOK;
+ *   int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms) {
+ *       // 从空闲中断填充的字节 FIFO 里搬数据，有多少给多少，不要切帧
+ *       return (int)copied;   // 0 = 当前无数据
  *   }
  *
  * 移植参考(RT-Thread):
@@ -77,20 +76,13 @@ int emda_port_uart_send(const uint8_t *data, uint16_t len)
     return EMDA_EOK;
 }
 
-int emda_port_uart_read_frame(uint8_t *out_buf,
-                              uint16_t buf_size,
-                              uint16_t *out_frame_len,
-                              uint32_t timeout_ms)
+int emda_port_uart_read(uint8_t *buf, uint16_t size, uint32_t timeout_ms)
 {
-    (void)out_buf;
-    (void)buf_size;
+    (void)buf;
+    (void)size;
     (void)timeout_ms;
-    if (out_frame_len != NULL)
-    {
-        *out_frame_len = 0U;
-    }
-    /* TODO: 移植时实现串口帧读取 */
-    return EMDA_ETIMEOUT;
+    /* TODO: 移植时从字节 FIFO(DMA+空闲中断/RingBuffer)搬数据，返回字节数 */
+    return 0;
 }
 
 /* ======================================================================== */

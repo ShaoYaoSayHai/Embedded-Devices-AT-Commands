@@ -2,12 +2,14 @@
  * @file test_main.c
  * @brief 主机侧冒烟测试：验证 AT核心 / 设备层 / socket层 / ML307A类 的协作
  *
+ * 重点是接收定界：
+ *   - payload 含 \r\n(且恰好落在分片边界上) 不能被切断
+ *   - payload 里出现 "+MIPCLOSE: 0" 这种假 URC 不能误触发
+ *   - payload 含 0x00 不能截断
+ *   - 单条 1460 字节的大 URC 不能把解析器卡死
+ *
  * 编译运行：
  *   make test
- * 或
- *   gcc -std=c99 -Wall -Wextra -Isource -Isource/class -Itest \
- *       source/emda_at.c source/emda_device.c source/emda_socket.c \
- *       source/class/emda_class_ml307a.c test/fake_modem.c test/test_main.c -o build/test_emda
  */
 
 #include <stdio.h>
@@ -90,7 +92,6 @@ static void run_ms(int ms)
     }
 }
 
-/* 等待网络状态到达目标值 */
 static int wait_net_state(emda_net_state_t target, int ms)
 {
     int i;
@@ -106,11 +107,26 @@ static int wait_net_state(emda_net_state_t target, int ms)
     return 0;
 }
 
+/* 读空 socket 接收缓冲，返回读到的总字节数 */
+static int drain_socket(int sock, uint8_t *buf, int cap)
+{
+    int total = 0;
+    int n;
+
+    while (total < cap &&
+           (n = emda_socket_recv(sock, &buf[total], (uint16_t)(cap - total))) > 0)
+    {
+        total += n;
+    }
+    return total;
+}
+
 int main(void)
 {
     int sock;
     int csq[2] = {0, 0};
-    char buf[32];
+    uint8_t buf[1600];
+    uint8_t bin[8];
 
     fake_modem_reset();
 
@@ -119,17 +135,16 @@ int main(void)
           "register ml307a class");
     CHECK(emda_device_start() == EMDA_EOK, "device start");
 
-    /* ---- 2. 监控阶梯：UNKNOWN -> INIT -> ... -> READY ---- */
+    /* ---- 2. 监控阶梯：UNKNOWN -> ... -> READY ---- */
     CHECK(wait_net_state(EMDA_NET_STATE_READY, 3000) == 1,
           "monitor ladder reaches READY (AT/CPIN/CEREG/CGATT)");
 
-    /* ---- 3. 信号质量巡检(CSQ 立即执行一次) ---- */
     run_ms(200);
     CHECK(emda_device_control(EMDA_ML307A_CTRL_GET_CSQ, csq) == EMDA_EOK,
           "device control GET_CSQ");
     CHECK(csq[0] == 20 && csq[1] == 99, "rssi parsed from +CSQ");
 
-    /* ---- 4. socket：创建 + 建链 ---- */
+    /* ---- 3. socket：创建 + 建链 ---- */
     sock = emda_socket_create(EMDA_SOCK_STREAM, on_sock_evt);
     CHECK(sock == 0, "socket create returns 0");
 
@@ -140,44 +155,102 @@ int main(void)
     CHECK(emda_socket_state_get(sock) == EMDA_SOCK_STATE_CONNECTED,
           "socket state == CONNECTED");
 
-    /* ---- 5. socket：发送(两段式 '>' 模式) ---- */
+    /* ---- 4. socket：发送(两段式 '>' 模式) ---- */
     CHECK(emda_socket_send(sock, "hello", 5) == EMDA_EOK, "socket send buffered");
     run_ms(300);
     CHECK(s_evt_sent == 1, "SENT event after MIPSEND payload");
     CHECK(strstr(fake_modem_last_cmd(), "AT+MIPSEND=0,5") != NULL,
           "MIPSEND uses length form");
 
-    /* ---- 6. socket：URC 数据分片重组 ---- */
-    s_evt_sent = 0;
-    fake_modem_inject_data_part1(0, "world", 2);
-    run_ms(40); /* 让前半段成为一个独立帧 */
-    fake_modem_inject_data_part2("rld");
+    /* ---- 5. 普通文本数据 ---- */
+    fake_modem_inject_data(sock, "world");
     run_ms(100);
-
     memset(buf, 0, sizeof(buf));
-    CHECK(emda_socket_recv(sock, buf, sizeof(buf)) == 5, "recv 5 bytes");
-    CHECK(strcmp(buf, "world") == 0, "payload reassembled across URC fragments");
+    CHECK(drain_socket(sock, buf, (int)sizeof(buf)) == 5, "recv 5 bytes");
+    CHECK(strcmp((char *)buf, "world") == 0, "plain text payload");
 
-    /* ---- 7. socket：关闭 ---- */
+    /* ---- 6. payload 含 CRLF，且被串口分片切成 3 字节一段 ---- */
+    fake_modem_set_read_limit(3U);
+    fake_modem_inject_data(sock, "AB\r\nCD");
+    run_ms(200);
+    memset(buf, 0, sizeof(buf));
+    CHECK(drain_socket(sock, buf, (int)sizeof(buf)) == 6,
+          "recv 6 bytes across fragmented reads");
+    CHECK(memcmp(buf, "AB\r\nCD", 6) == 0,
+          "CRLF inside payload is not treated as boundary");
+    fake_modem_set_read_limit(0U);
+
+    /* ---- 7. payload 里伪装一条 URC，不能被误触发 ---- */
+    {
+        static const char disguised[] = "x\r\n+MIPCLOSE: 0\r\n";
+        int expect = (int)strlen(disguised);
+
+        fake_modem_set_read_limit(4U);
+        fake_modem_inject_data(sock, disguised);
+        run_ms(300);
+        memset(buf, 0, sizeof(buf));
+        CHECK(drain_socket(sock, buf, (int)sizeof(buf)) == expect,
+              "recv disguised-URC payload in full");
+        CHECK(memcmp(buf, disguised, (size_t)expect) == 0,
+              "payload bytes match exactly");
+    }
+    CHECK(emda_socket_state_get(sock) == EMDA_SOCK_STATE_CONNECTED,
+          "fake +MIPCLOSE inside payload does not close socket");
+    fake_modem_set_read_limit(0U);
+
+    /* ---- 8. payload 含 0x00 ---- */
+    bin[0] = (uint8_t)'A';
+    bin[1] = 0x00U;
+    bin[2] = (uint8_t)'B';
+    fake_modem_inject_data_bin(sock, bin, 3U);
+    run_ms(100);
+    memset(buf, 0, sizeof(buf));
+    CHECK(drain_socket(sock, buf, (int)sizeof(buf)) == 3, "recv 3 bytes with 0x00");
+    CHECK(buf[0] == 'A' && buf[1] == 0x00U && buf[2] == 'B',
+          "0x00 inside payload preserved");
+
+    /* ---- 9. 单条 1460 字节大 URC：解析器不能被卡死 ---- */
+    for (int i = 0; i < 1460; i++)
+    {
+        buf[i] = (uint8_t)('a' + (i % 26));
+    }
+    fake_modem_inject_data_bin(sock, buf, 1460U);
+    run_ms(400);
+    memset(buf, 0, sizeof(buf));
+    CHECK(drain_socket(sock, buf, (int)sizeof(buf)) == (int)EMDA_SOCK_RX_BUFFER_SIZE,
+          "1460-byte URC parsed, socket buffer keeps capacity bytes");
+    CHECK(emda_at_rx_count() == 0U, "rx ring drained after oversized urc");
+
+    /* 后续事务仍然正常，说明解析器已重新同步 */
+    s_evt_sent = 0;
+    CHECK(emda_socket_send(sock, "ping", 4) == EMDA_EOK, "send after big urc");
+    run_ms(300);
+    CHECK(s_evt_sent == 1, "transaction works after big urc");
+
+    /* ---- 10. 文本响应被拆成 2 字节一片，仍能匹配 OK ---- */
+    s_exec_ok = 0;
+    fake_modem_set_read_limit(2U);
+    CHECK(emda_device_exec("AT+CPIN?\r\n", on_exec_resp, 2000U, on_exec_timeout) == EMDA_EOK,
+          "device exec queued (fragmented read)");
+    run_ms(600);
+    CHECK(s_exec_ok == 1, "fragmented text response still matched");
+    fake_modem_set_read_limit(0U);
+
+    /* ---- 11. socket：关闭 ---- */
     CHECK(emda_socket_close(sock) == EMDA_EOK, "socket close");
     run_ms(100);
     CHECK(s_evt_closed == 1, "CLOSED event");
     CHECK(strstr(fake_modem_last_cmd(), "AT+MIPCLOSE=0") != NULL,
           "close uses MIPCLOSE");
 
-    /* ---- 8. 业务临时指令：正常响应 ---- */
-    s_exec_ok = 0;
-    CHECK(emda_device_exec("AT+CPIN?\r\n", on_exec_resp, 1000U, on_exec_timeout) == EMDA_EOK,
-          "device exec queued");
-    run_ms(500);
-    CHECK(s_exec_ok == 1, "business command response handled");
-
-    /* ---- 9. 业务临时指令：超时兜底 ---- */
+    /* ---- 12. 超时兜底 ---- */
     s_exec_timeout = 0;
     CHECK(emda_device_exec("AT+NORESP\r\n", on_exec_resp, 100U, on_exec_timeout) == EMDA_EOK,
           "device exec no-response queued");
     run_ms(400);
     CHECK(s_exec_timeout == 1, "timeout callback fired");
+
+    CHECK(s_evt_connect_failed == 0, "no unexpected connect failure");
 
     printf("\r\n==== %s (%d failures) ====\r\n",
            (s_failures == 0) ? "PASS" : "FAIL", s_failures);

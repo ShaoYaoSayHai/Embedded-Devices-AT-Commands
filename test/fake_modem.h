@@ -16,8 +16,17 @@ void fake_modem_reset(void);
 /* 注入一段原始 URC 文本(模拟模组主动上报) */
 void fake_modem_inject(const char *text);
 
-/* 注入一条 +MIPURC: "rtcp",<id>,<len>,<data> 数据上报 */
+/* 注入一条 +MIPURC: "rtcp",<id>,<len>,<data> 数据上报(文本) */
 void fake_modem_inject_data(int id, const char *data);
+
+/* 注入一条数据上报(任意二进制，可含 \r\n 与 0x00) */
+void fake_modem_inject_data_bin(int id, const uint8_t *data, uint16_t len);
+
+/*
+ * 限制每次串口读返回的字节数，用来模拟 DMA 分片(0 = 不限)。
+ * 这是验证「按长度定界」是否真的不依赖分片边界的关键开关。
+ */
+void fake_modem_set_read_limit(uint16_t limit);
 
 /* 注入数据上报的前半段(用于验证 URC 分片重组) */
 void fake_modem_inject_data_part1(int id, const char *data, int part_len);

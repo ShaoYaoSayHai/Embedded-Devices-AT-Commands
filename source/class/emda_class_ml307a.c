@@ -14,8 +14,8 @@
  *   AT+MIPCLOSE=<id>                            ->  OK / URC +MIPCLOSE:<id>
  *   收到数据：URC +MIPURC: "rtcp",<id>,<len>,<data>
  *
- * 注意：普通模式下接收数据内联在 URC 里，如果业务是二进制协议(含\r\n)，
- *       建议改用 AT+MIPCFG="encoding" 或 流缓存模式 + AT+MIPRD。
+ * 接收数据在 URC 表里声明为「带长度的整段」：AT 核心按 <len> 精确圈定
+ * header + payload，二进制内容不会被当成文本行扫描，含 \r\n / 0x00 也安全。
  *
  * @version 0.3
  * @date 2026-11-06
@@ -40,8 +40,12 @@
 #define ML307A_OPEN_TIMEOUT_MS   (15000U) /* 建链事务超时 */
 #define ML307A_SEND_TIMEOUT_MS   (10000U) /* 发送事务超时 */
 #define ML307A_CLOSE_TIMEOUT_MS  (5000U)  /* 关闭事务超时 */
-#define ML307A_URC_BUFFER_SIZE   (256U)   /* URC 重组缓冲 */
-#define ML307A_LINE_MAX          (128U)   /* 单行 URC 最大解析长度 */
+
+/* "+MIPURC: \"rtcp\"," 的长度，用于跳过前缀直接解析字段 */
+#define ML307A_RTCP_PREFIX_LEN   (16U)
+
+/* 单条 URC 允许的最大数据长度(手册: <send_length>/单包上限 1460) */
+#define ML307A_MAX_DATA_LEN      (1460)
 
 /* ======================================================================== */
 /*                          内部状态                                          */
@@ -49,10 +53,6 @@
 
 static int s_rssi = 99;
 static int s_ber = 99;
-
-/* URC 重组缓冲：串口分片可能把一条 URC 拆成多次上报 */
-static uint8_t s_urc_buf[ML307A_URC_BUFFER_SIZE + 1U];
-static uint16_t s_urc_len = 0U;
 
 /* 当前在途的 socket 操作 */
 static int s_send_sock = -1;
@@ -89,8 +89,8 @@ static int s_open_pop(void)
     return sock;
 }
 
-/* 前置声明：URC 总入口(定义在后面，供 init 注册) */
-static int ml307a_urc_cb(const uint8_t *buffer, uint16_t len);
+/* 前置声明：注册 URC 表(表与处理函数定义在后面) */
+static int ml307a_urc_attach(void);
 
 /* ======================================================================== */
 /*                          小工具：整数解析                                  */
@@ -383,13 +383,11 @@ static int ml307a_init(emda_device_t *dev)
         }
     }
 
-    s_urc_len = 0U;
-    s_urc_buf[0] = '\0';
     s_send_sock = -1;
     s_open_head = 0U;
     s_open_count = 0U;
 
-    return emda_at_urc_attach("ml307a", ml307a_urc_cb);
+    return ml307a_urc_attach();
 }
 
 static int ml307a_control(emda_device_t *dev, int cmd, void *arg)
@@ -600,206 +598,238 @@ static int ml307a_sock_close(emda_device_t *dev, int sock)
 }
 
 /* ======================================================================== */
-/*                          URC 解析                                          */
+/*                          URC 处理                                          */
 /* ======================================================================== */
+/*
+ * 每条 URC 在表里声明「前缀 + 段长计算 + 处理函数」。
+ * AT 核心保证回调拿到的是完整且连续的一条，分片由核心负责等齐。
+ * 带裸数据的条目必须排在通用 "+MIPURC:" 之前，否则会被按行吃掉。
+ */
 
 /**
- * @brief 处理一条完整文本 URC(已去掉\r\n)
+ * @brief 从一段非 NUL 结尾的数据里读取十进制字段
+ * @param buf        数据起点
+ * @param avail      可用长度
+ * @param pos        输入/输出：当前偏移
+ * @param out        输出值
+ * @param need_comma 1=字段后必须是逗号，0=字段是最后一个
+ * @return EMDA_EOK / EMDA_ETIMEOUT(数据未收全) / EMDA_ERROR(格式不符)
  */
-static void ml307a_handle_line(const char *line)
+static int s_read_field(const uint8_t *buf, uint16_t avail, uint16_t *pos,
+                        int *out, int need_comma)
 {
-    const char *p;
+    int value = 0;
+    int digits = 0;
+
+    if (buf == NULL || pos == NULL || out == NULL)
+    {
+        return EMDA_EINVAL;
+    }
+
+    while (*pos < avail && (buf[*pos] == ' ' || buf[*pos] == '"'))
+    {
+        (*pos)++;
+    }
+    if (*pos >= avail)
+    {
+        return EMDA_ETIMEOUT;
+    }
+
+    while (*pos < avail && buf[*pos] >= '0' && buf[*pos] <= '9')
+    {
+        value = value * 10 + (int)(buf[*pos] - '0');
+        (*pos)++;
+        digits++;
+    }
+
+    if (digits == 0)
+    {
+        return EMDA_ERROR;
+    }
+    if (*pos >= avail)
+    {
+        return EMDA_ETIMEOUT;
+    }
+    if (need_comma)
+    {
+        if (buf[*pos] != ',')
+        {
+            return EMDA_ERROR;
+        }
+        (*pos)++;
+    }
+
+    *out = value;
+    return EMDA_EOK;
+}
+
+/**
+ * @brief 在一段非 NUL 结尾的数据里查找子串
+ */
+static int s_mem_contains(const uint8_t *buf, uint16_t len, const char *needle)
+{
+    uint16_t nlen = (uint16_t)strlen(needle);
+
+    if (nlen == 0U || len < nlen)
+    {
+        return 0;
+    }
+    for (uint16_t i = 0U; (uint32_t)i + (uint32_t)nlen <= (uint32_t)len; i++)
+    {
+        if (memcmp(&buf[i], needle, nlen) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ---- 数据上报：+MIPURC: "rtcp"|"rudp",<id>,<len>,<data> ---- */
+
+/**
+ * @brief 计算数据上报的整段长度
+ * @return >0 总长度(header+payload)；0=等更多数据；<0=格式不认识
+ */
+static int s_rtcp_seg_len(const uint8_t *buf, uint16_t avail)
+{
+    uint16_t pos = ML307A_RTCP_PREFIX_LEN;
     int id = 0;
-    int val = 0;
+    int data_len = 0;
+    int ret;
 
-    if (strncmp(line, "+MIPOPEN:", 9) == 0)
+    ret = s_read_field(buf, avail, &pos, &id, 1);
+    if (ret == EMDA_ETIMEOUT)
     {
-        const char *q = s_parse_int(line + 9, &id);
-        if (q != NULL && s_parse_int(q, &val) != NULL)
-        {
-            /* result=0 成功，其余为失败 */
-            emda_socket_report(id, (val == 0) ? EMDA_SOCK_EVT_CONNECTED
-                                              : EMDA_SOCK_EVT_CONNECT_FAILED);
-        }
-        return;
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
     }
 
-    if (strncmp(line, "+MIPCLOSE:", 10) == 0)
+    ret = s_read_field(buf, avail, &pos, &data_len, 1);
+    if (ret == EMDA_ETIMEOUT)
     {
-        if (s_parse_int(line + 10, &id) != NULL)
-        {
-            emda_socket_report(id, EMDA_SOCK_EVT_CLOSED);
-        }
-        return;
+        return 0;
+    }
+    if (ret != EMDA_EOK)
+    {
+        return -1;
     }
 
-    if (strncmp(line, "+MIPURC:", 8) == 0)
+    if (data_len < 0 || data_len > ML307A_MAX_DATA_LEN)
     {
-        if (strstr(line, "\"disconn\"") != NULL)
+        return -1;
+    }
+
+    return (int)pos + data_len;
+}
+
+static int s_rtcp_payload(const uint8_t *data, uint16_t len)
+{
+    uint16_t pos = ML307A_RTCP_PREFIX_LEN;
+    int id = 0;
+    int data_len = 0;
+
+    if (s_read_field(data, len, &pos, &id, 1) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+    if (s_read_field(data, len, &pos, &data_len, 1) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+    if (data_len < 0 || (uint32_t)pos + (uint32_t)data_len > (uint32_t)len)
+    {
+        return EMDA_ERROR;
+    }
+
+    emda_socket_input(id, &data[pos], (uint16_t)data_len);
+    return EMDA_EOK;
+}
+
+/* ---- 文本 URC ---- */
+
+static int s_urc_mipopen(const uint8_t *data, uint16_t len)
+{
+    uint16_t pos = 9U; /* "+MIPOPEN:" */
+    int id = 0;
+    int result = 0;
+
+    if (s_read_field(data, len, &pos, &id, 1) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+    if (s_read_field(data, len, &pos, &result, 0) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+
+    /* result=0 成功，其余为失败 */
+    emda_socket_report(id, (result == 0) ? EMDA_SOCK_EVT_CONNECTED
+                                         : EMDA_SOCK_EVT_CONNECT_FAILED);
+    return EMDA_EOK;
+}
+
+static int s_urc_mipclose(const uint8_t *data, uint16_t len)
+{
+    uint16_t pos = 10U; /* "+MIPCLOSE:" */
+    int id = 0;
+
+    if (s_read_field(data, len, &pos, &id, 0) != EMDA_EOK)
+    {
+        return EMDA_ERROR;
+    }
+
+    emda_socket_report(id, EMDA_SOCK_EVT_CLOSED);
+    return EMDA_EOK;
+}
+
+static int s_urc_mipurc_other(const uint8_t *data, uint16_t len)
+{
+    /* +MIPURC: "disconn",<id>,<state> */
+    if (s_mem_contains(data, len, "\"disconn\""))
+    {
+        uint16_t pos = 8U;
+        int id = 0;
+
+        while (pos < len && data[pos] != ',')
         {
-            /* +MIPURC: "disconn",<id>,<state> */
-            p = strchr(line + 8, ',');
-            if (p != NULL && s_parse_int(p + 1, &id) != NULL)
+            pos++;
+        }
+        if (pos < len)
+        {
+            pos++;
+            if (s_read_field(data, len, &pos, &id, 0) == EMDA_EOK)
             {
                 emda_socket_report(id, EMDA_SOCK_EVT_CLOSED);
             }
         }
-        else if (strstr(line, "\"drop\"") != NULL)
-        {
-            EMDA_LOG("[ml307a] %s\r\n", line);
-        }
-        return;
+        return EMDA_EOK;
     }
+
+    if (s_mem_contains(data, len, "\"drop\""))
+    {
+        EMDA_LOG("[ml307a] urc drop\r\n");
+    }
+
+    return EMDA_EOK;
 }
 
-/**
- * @brief 处理数据上报 +MIPURC: "rtcp"/"rudp",<id>,<len>,<data>
- * @return 1=解析完成(consumed 有效), 0=数据不完整需等待
- */
-static int ml307a_handle_data(const uint8_t *buffer, uint16_t len, uint16_t *consumed)
+/* ---- URC 表 ---- */
+
+static const emda_urc_t s_ml307a_urc[] = {
+    {"+MIPURC: \"rtcp\",", s_rtcp_seg_len, s_rtcp_payload},
+    {"+MIPURC: \"rudp\",", s_rtcp_seg_len, s_rtcp_payload},
+    {"+MIPOPEN:", NULL, s_urc_mipopen},
+    {"+MIPCLOSE:", NULL, s_urc_mipclose},
+    {"+MIPURC:", NULL, s_urc_mipurc_other},
+};
+
+static int ml307a_urc_attach(void)
 {
-    const char *p = (const char *)buffer;
-    const char *q;
-    int id = 0;
-    int data_len = 0;
-    uint16_t prefix_len;
-    uint16_t total;
-
-    /* 跳过 '+MIPURC: "rtcp",' 这段前缀，定位到 <id> */
-    q = strchr(p, ',');
-    if (q == NULL)
-    {
-        return 0;
-    }
-
-    q = s_parse_int(q + 1, &id);
-    if (q == NULL)
-    {
-        return 0;
-    }
-    q = s_parse_int(q, &data_len);
-    if (q == NULL || data_len < 0)
-    {
-        return 0;
-    }
-
-    prefix_len = (uint16_t)(q - p);
-    if ((uint32_t)prefix_len + (uint32_t)data_len > (uint32_t)len)
-    {
-        return 0; /* 后续分片还没到 */
-    }
-
-    emda_socket_input(id, (const uint8_t *)q, (uint16_t)data_len);
-
-    total = (uint16_t)(prefix_len + (uint16_t)data_len);
-    while (total < len && (buffer[total] == '\r' || buffer[total] == '\n'))
-    {
-        total++;
-    }
-
-    *consumed = total;
-    return 1;
-}
-
-/**
- * @brief 从重组缓冲里解析出一条 URC
- * @return 消费的字节数，0=数据不完整
- */
-static uint16_t ml307a_urc_parse_one(const uint8_t *buffer, uint16_t len)
-{
-    uint16_t eol;
-    uint16_t consumed = 0U;
-    char line[ML307A_LINE_MAX];
-
-    /* 先丢掉前导的空行 */
-    if (buffer[0] == '\r' || buffer[0] == '\n')
-    {
-        return 1U;
-    }
-
-    /* 数据上报：带长度，按长度精确消费 */
-    if (len >= 16U &&
-        (memcmp(buffer, "+MIPURC: \"rtcp\",", 16U) == 0 ||
-         memcmp(buffer, "+MIPURC: \"rudp\",", 16U) == 0))
-    {
-        if (ml307a_handle_data(buffer, len, &consumed) == 0)
-        {
-            return 0U;
-        }
-        return consumed;
-    }
-
-    /* 其它都是文本行，按 '\n' 切分 */
-    for (eol = 0U; eol < len; eol++)
-    {
-        if (buffer[eol] == '\n')
-        {
-            break;
-        }
-    }
-    if (eol >= len)
-    {
-        return 0U; /* 还没收到完整行 */
-    }
-
-    if (eol >= ML307A_LINE_MAX)
-    {
-        return (uint16_t)(eol + 1U); /* 超长行直接丢弃 */
-    }
-
-    memcpy(line, buffer, eol);
-    line[eol] = '\0';
-    if (eol > 0U && line[eol - 1U] == '\r')
-    {
-        line[eol - 1U] = '\0';
-    }
-
-    ml307a_handle_line(line);
-    return (uint16_t)(eol + 1U);
-}
-
-/**
- * @brief URC 总入口：重组 -> 逐条解析
- */
-static int ml307a_urc_cb(const uint8_t *buffer, uint16_t len)
-{
-    int handled = EMDA_ERROR;
-
-    if (buffer == NULL || len == 0U)
-    {
-        return EMDA_ERROR;
-    }
-
-    /* 追加到重组缓冲；溢出则丢弃旧数据重新同步 */
-    if ((uint32_t)s_urc_len + (uint32_t)len > ML307A_URC_BUFFER_SIZE)
-    {
-        EMDA_LOG("[ml307a] urc buffer overflow\r\n");
-        s_urc_len = 0U;
-    }
-    if (len > ML307A_URC_BUFFER_SIZE)
-    {
-        return EMDA_ERROR;
-    }
-    memcpy(&s_urc_buf[s_urc_len], buffer, len);
-    s_urc_len = (uint16_t)(s_urc_len + len);
-    s_urc_buf[s_urc_len] = '\0';
-
-    while (s_urc_len > 0U)
-    {
-        uint16_t used = ml307a_urc_parse_one(s_urc_buf, s_urc_len);
-
-        if (used == 0U)
-        {
-            break; /* 等待后续分片 */
-        }
-
-        handled = EMDA_EOK;
-        s_urc_len = (uint16_t)(s_urc_len - used);
-        memmove(s_urc_buf, &s_urc_buf[used], s_urc_len);
-        s_urc_buf[s_urc_len] = '\0';
-    }
-
-    return handled;
+    return emda_at_urc_attach(s_ml307a_urc,
+                              (uint32_t)(sizeof(s_ml307a_urc) / sizeof(s_ml307a_urc[0])));
 }
 
 /* ======================================================================== */

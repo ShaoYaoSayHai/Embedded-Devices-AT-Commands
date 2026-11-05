@@ -3,16 +3,18 @@
  * @author Zorian(1551769443@qq.com)
  * @brief  EMDA AT 事务核心实现
  *
- * 架构(非阻塞轮询)：
- *   1. 接收窗口：把串口分片聚合成一帧(CRLF 立即交付，其余静默兜底)
- *   2. URC 分发：每帧先给全部 URC 回调，再喂给在途事务
- *   3. 事务状态机：IDLE -> SEND -> WAITING -> RESP_OK / TIMEOUT
- *   4. 指令队列：业务/设备层提交的指令按 FIFO 串行执行
- *   5. 两段式发送：指令 -> 提示符 -> 原始数据
+ * 接收侧不再使用「时间窗 + CRLF 快判」猜边界，改为按内容定界：
  *
- * 依赖关系：本文件只调用 emda_port.h 声明的接口。
+ *   ring 头部
+ *     ├─ a) 提示符(如 ">")        -> 发送两段式数据并消费
+ *     ├─ b) URC 前缀命中          -> 按 seg_len 算整段长度，到齐才回调
+ *     ├─ c) 文本行(CRLF)          -> 累积进响应缓冲交给 resp_cb
+ *     └─ d) 都不够                -> 原样等待，下一轮继续
  *
- * @version 0.3
+ * 关键点：前缀命中但整段未收全时**直接返回等待**，不会把半条 URC 当文本行，
+ * 也不会把二进制 payload 交给任何文本匹配。
+ *
+ * @version 0.4
  * @date 2026-11-06
  *
  * @copyright Copyright (c) 2026
@@ -27,14 +29,6 @@
 /*                          内部数据结构                                      */
 /* ======================================================================== */
 
-/* URC 回调表条目 */
-typedef struct
-{
-    char name[EMDA_NAME_LEN];
-    emda_urc_cb_t cb;
-    uint8_t is_used;
-} emda_urc_entry_t;
-
 /* 指令队列条目 */
 typedef struct
 {
@@ -45,21 +39,33 @@ typedef struct
     uint32_t timeout_ms;
 } emda_at_msg_t;
 
-/* UART 接收采集缓冲区：仅由接收窗口状态机写入 */
-static uint8_t s_rx_collect_buffer[EMDA_RX_WINDOW_BUFFER_SIZE + 1U];
+/* URC 表条目(内部缓存 prefix 长度，避免每轮 strlen) */
+typedef struct
+{
+    const char *prefix;
+    uint16_t prefix_len;
+    emda_urc_seg_cb_t seg_len;
+    emda_urc_cb_t handler;
+} emda_urc_entry_t;
 
-/* 当前在途事务的响应累积缓冲区：与下一轮 UART 采集完全分离 */
-static uint8_t s_resp_buffer[EMDA_RX_WINDOW_BUFFER_SIZE + 1U];
+/* 接收环形缓冲：保证 [head, head+len) 连续，回绕前先压缩 */
+static uint8_t s_rx[EMDA_RX_BUFFER_SIZE];
+static uint16_t s_rx_head = 0U;
+static uint16_t s_rx_len = 0U;
+
+/* 当前在途事务的响应文本累积(仅文本，二进制不经过这里) */
+static uint8_t s_resp[EMDA_RESP_BUFFER_SIZE + 1U];
 static uint16_t s_resp_len = 0U;
+
+/* URC 表 */
+static emda_urc_entry_t s_urc[EMDA_URC_TABLE_SIZE];
+static uint8_t s_urc_count = 0U;
 
 /* 指令队列(环形缓冲) */
 static emda_at_msg_t s_cmd_queue[EMDA_CMD_QUEUE_SIZE];
 static volatile uint8_t s_q_head = 0U;
 static volatile uint8_t s_q_tail = 0U;
 static volatile uint8_t s_q_count = 0U;
-
-/* URC 回调表 */
-static emda_urc_entry_t s_urc_table[EMDA_URC_TABLE_SIZE];
 
 /* 事务状态机运行时字段 */
 static emda_at_state_t s_state = EMDA_AT_STATE_IDLE;
@@ -70,8 +76,6 @@ static uint16_t s_cur_cmd_len = 0U;
 static uint32_t s_cur_timeout_ms = 0U;
 static emda_tick_t s_send_tick = 0U;
 static emda_tick_t s_ok_tick = 0U;
-
-/* 状态机推进节奏；UART 接收与 URC 分发不受此限制 */
 static emda_tick_t s_step_tick = 0U;
 
 /* 两段式发送：提示符 + 原始数据 */
@@ -80,24 +84,384 @@ static uint8_t s_payload[EMDA_TX_PAYLOAD_SIZE];
 static uint16_t s_payload_len = 0U;
 static uint8_t s_payload_sent = 0U;
 
-/* 接收窗口状态 */
-typedef enum
-{
-    RX_WIN_IDLE = 0U,
-    RX_WIN_COLLECTING,
-} rx_win_state_t;
-
-static rx_win_state_t s_rx_win_state = RX_WIN_IDLE;
-static emda_tick_t s_rx_win_last_tick = 0U;
-static uint16_t s_rx_win_len = 0U;
-
-/* 前置声明：加载指令(定义在后面，供 submit_raw 直接启动事务) */
+/* 前置声明 */
 static void s_load_command(emda_tick_t now,
                            const char *cmd,
                            uint16_t cmd_len,
                            emda_at_resp_cb_t resp_cb,
                            uint32_t timeout_ms,
                            emda_at_timeout_cb_t timeout_cb);
+
+/* ======================================================================== */
+/*                          接收环形缓冲                                      */
+/* ======================================================================== */
+
+/**
+ * @brief 保证 [head, head+len) 连续：写指针到顶且还有未消费数据时前移
+ */
+static void s_rx_prepare(void)
+{
+    if (s_rx_head == 0U)
+    {
+        return;
+    }
+    if ((uint32_t)s_rx_head + (uint32_t)s_rx_len >= EMDA_RX_BUFFER_SIZE)
+    {
+        if (s_rx_len > 0U)
+        {
+            memmove(s_rx, &s_rx[s_rx_head], s_rx_len);
+        }
+        s_rx_head = 0U;
+    }
+}
+
+static void s_rx_consume(uint16_t len)
+{
+    if (len >= s_rx_len)
+    {
+        s_rx_head = 0U;
+        s_rx_len = 0U;
+        return;
+    }
+
+    s_rx_head = (uint16_t)(s_rx_head + len);
+    s_rx_len = (uint16_t)(s_rx_len - len);
+
+    if (s_rx_len == 0U)
+    {
+        s_rx_head = 0U;
+    }
+}
+
+/**
+ * @brief 把串口当前可读的字节搬进 ring(有上限，避免单轮被数据占满)
+ * @note 写不下就留在 port 层的 FIFO 里，形成天然背压，不丢数据
+ */
+static void s_rx_pump(void)
+{
+    for (uint32_t i = 0U; i < EMDA_RX_READS_PER_POLL; i++)
+    {
+        uint16_t space;
+        int n;
+
+        s_rx_prepare();
+        space = (uint16_t)(EMDA_RX_BUFFER_SIZE - s_rx_head - s_rx_len);
+        if (space == 0U)
+        {
+            break; /* ring 满，下一轮消费后再读 */
+        }
+
+        n = emda_port_uart_read(&s_rx[s_rx_head + s_rx_len], space, 0U);
+        if (n <= 0)
+        {
+            break; /* 0=暂无数据, <0=错误 */
+        }
+        if ((uint16_t)n > space)
+        {
+            n = (int)space;
+        }
+        s_rx_len = (uint16_t)(s_rx_len + (uint16_t)n);
+    }
+}
+
+/**
+ * @brief 跳过 URC 尾部的 CRLF(最多2字节)
+ */
+static void s_rx_skip_eol(void)
+{
+    uint8_t n = 0U;
+
+    while (n < 2U && s_rx_len > 0U)
+    {
+        uint8_t ch = s_rx[s_rx_head];
+        if (ch != '\r' && ch != '\n')
+        {
+            break;
+        }
+        s_rx_consume(1U);
+        n++;
+    }
+}
+
+/* ======================================================================== */
+/*                          响应文本累积                                      */
+/* ======================================================================== */
+
+static void s_resp_reset(void)
+{
+    s_resp[0] = '\0';
+    s_resp_len = 0U;
+}
+
+/**
+ * @brief 把一行文本追加到响应缓冲；溢出时丢弃最旧数据
+ */
+static void s_resp_append(const uint8_t *data, uint16_t len)
+{
+    if (data == NULL || len == 0U)
+    {
+        return;
+    }
+
+    if (len >= EMDA_RESP_BUFFER_SIZE)
+    {
+        memcpy(s_resp, &data[len - EMDA_RESP_BUFFER_SIZE], EMDA_RESP_BUFFER_SIZE);
+        s_resp_len = EMDA_RESP_BUFFER_SIZE;
+    }
+    else
+    {
+        uint32_t combined = (uint32_t)s_resp_len + (uint32_t)len;
+        if (combined > EMDA_RESP_BUFFER_SIZE)
+        {
+            uint16_t discard = (uint16_t)(combined - EMDA_RESP_BUFFER_SIZE);
+            memmove(s_resp, &s_resp[discard], (uint16_t)(s_resp_len - discard));
+            s_resp_len = (uint16_t)(s_resp_len - discard);
+        }
+        memcpy(&s_resp[s_resp_len], data, len);
+        s_resp_len = (uint16_t)(s_resp_len + len);
+    }
+
+    s_resp[s_resp_len] = '\0';
+}
+
+/**
+ * @brief 找一行文本的结束位置(含结尾 '\n')
+ * @return 0 = 还没收到完整一行
+ */
+static uint16_t s_find_line(const uint8_t *data, uint16_t avail)
+{
+    for (uint16_t i = 0U; i < avail; i++)
+    {
+        if (data[i] == '\n')
+        {
+            return (uint16_t)(i + 1U);
+        }
+    }
+    return 0U;
+}
+
+/* ======================================================================== */
+/*                          URC 匹配                                          */
+/* ======================================================================== */
+
+/**
+ * @brief 在缓冲头部探测一条 URC
+ *
+ * @param data    缓冲头指针(连续)
+ * @param avail   可用字节数
+ * @param entry   输出命中的表项
+ * @param seg_len 输出整条 URC 的字节数
+ * @return 1=命中且完整, 0=不是URC, -1=前缀命中但数据未收全, -2=长度非法
+ */
+static int s_urc_probe(const uint8_t *data,
+                       uint16_t avail,
+                       const emda_urc_entry_t **entry,
+                       uint16_t *seg_len)
+{
+    for (uint8_t i = 0U; i < s_urc_count; i++)
+    {
+        const emda_urc_entry_t *e = &s_urc[i];
+        uint16_t cmp_len;
+        int total;
+
+        if (e->prefix_len == 0U)
+        {
+            continue;
+        }
+
+        cmp_len = (avail < e->prefix_len) ? avail : e->prefix_len;
+        if (memcmp(data, e->prefix, cmp_len) != 0)
+        {
+            continue;
+        }
+        if (avail < e->prefix_len)
+        {
+            return -1; /* 前缀还没收全 */
+        }
+
+        total = (e->seg_len != NULL) ? e->seg_len(data, avail)
+                                     : (int)s_find_line(data, avail);
+        if (total == 0)
+        {
+            return -1; /* 整段还没收全 */
+        }
+        if (total < 0)
+        {
+            continue; /* 该表项认为格式不符，交给后续表项 */
+        }
+        if (total > (int)EMDA_RX_BUFFER_SIZE)
+        {
+            return -2; /* 超过缓冲能力，无法定界 */
+        }
+        if (total > (int)avail)
+        {
+            return -1;
+        }
+
+        *entry = e;
+        *seg_len = (uint16_t)total;
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 探测并分发一条 URC
+ * @return 1=已消费(consumed 有效), 0=不是URC, -1=等更多, -2=长度非法
+ */
+static int s_urc_try(const uint8_t *data, uint16_t avail, uint16_t *consumed)
+{
+    const emda_urc_entry_t *entry = NULL;
+    uint16_t seg = 0U;
+    int ret;
+
+    *consumed = 0U;
+
+    ret = s_urc_probe(data, avail, &entry, &seg);
+    if (ret != 1)
+    {
+        return ret;
+    }
+
+    if (entry->handler != NULL)
+    {
+        (void)entry->handler(data, seg);
+    }
+
+    *consumed = seg;
+    return 1;
+}
+
+/* ======================================================================== */
+/*                          两段式发送                                        */
+/* ======================================================================== */
+
+static void s_send_payload(void)
+{
+    if (s_prompt == NULL || s_payload_sent != 0U || s_payload_len == 0U)
+    {
+        return;
+    }
+
+    if (emda_port_uart_send(s_payload, s_payload_len) == EMDA_EOK)
+    {
+        s_payload_sent = 1U;
+        EMDA_LOG("[emda_at] payload sent %u bytes\r\n", (unsigned)s_payload_len);
+    }
+}
+
+/**
+ * @brief 在缓冲里找提示符(如 ">")，命中则立刻发送原始数据
+ * @return 1=已命中并消费(consumed 有效), 0=未命中
+ */
+static int s_prompt_try(const uint8_t *data, uint16_t avail, uint16_t *consumed)
+{
+    uint16_t plen;
+
+    *consumed = 0U;
+
+    if (s_prompt == NULL || s_payload_sent != 0U)
+    {
+        return 0;
+    }
+
+    plen = (uint16_t)strlen(s_prompt);
+    if (plen == 0U || avail < plen)
+    {
+        return 0;
+    }
+
+    for (uint16_t i = 0U; (uint32_t)i + (uint32_t)plen <= (uint32_t)avail; i++)
+    {
+        if (memcmp(&data[i], s_prompt, plen) == 0)
+        {
+            s_send_payload();
+            *consumed = (uint16_t)(i + plen);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* ======================================================================== */
+/*                          解析主循环                                        */
+/* ======================================================================== */
+
+/**
+ * @brief 按 AT 语法解析接收缓冲，能消费多少消费多少
+ */
+static void s_rx_parse(emda_tick_t now)
+{
+    for (;;)
+    {
+        const uint8_t *data;
+        uint16_t avail;
+        uint16_t consumed = 0U;
+        int ret;
+
+        s_rx_prepare();
+        avail = s_rx_len;
+        if (avail == 0U)
+        {
+            return;
+        }
+        data = &s_rx[s_rx_head];
+
+        /* ---- a) 两段式发送的提示符 ---- */
+        if (s_prompt_try(data, avail, &consumed) == 1)
+        {
+            s_rx_consume(consumed);
+            continue;
+        }
+
+        /* ---- b) URC：整段到齐才消费 ---- */
+        ret = s_urc_try(data, avail, &consumed);
+        if (ret == -1)
+        {
+            return; /* 半条 URC：等更多数据，绝不落到文本分支 */
+        }
+        if (ret == -2)
+        {
+            uint16_t drop = s_find_line(data, avail);
+            s_rx_consume((drop > 0U) ? drop : avail);
+            EMDA_LOG("[emda_at] drop oversized urc\r\n");
+            continue;
+        }
+        if (ret == 1)
+        {
+            s_rx_consume(consumed);
+            s_rx_skip_eol();
+            continue;
+        }
+
+        /* ---- c) 响应文本行 ---- */
+        consumed = s_find_line(data, avail);
+        if (consumed == 0U)
+        {
+            return; /* 半行，等更多 */
+        }
+
+        if (s_state == EMDA_AT_STATE_SEND || s_state == EMDA_AT_STATE_WAITING)
+        {
+            s_resp_append(data, consumed);
+            s_rx_consume(consumed);
+
+            if (s_resp_cb != NULL && s_resp_cb(s_resp, s_resp_len) == EMDA_EOK)
+            {
+                s_resp_cb = NULL;
+                s_state = EMDA_AT_STATE_RESP_OK;
+                s_ok_tick = now;
+            }
+        }
+        else
+        {
+            /* 没有在途事务：未识别的行直接丢弃 */
+            s_rx_consume(consumed);
+        }
+    }
+}
 
 /* ======================================================================== */
 /*                          状态访问                                          */
@@ -118,14 +482,32 @@ uint8_t emda_at_queue_count(void)
     return count;
 }
 
+uint16_t emda_at_rx_count(void)
+{
+    return s_rx_len;
+}
+
 int emda_at_ready(void)
 {
     int ready;
 
     emda_port_enter_critical();
-    ready = (s_state == EMDA_AT_STATE_IDLE && s_q_count == 0U &&
-             s_rx_win_state == RX_WIN_IDLE) ? 1 : 0;
+    ready = (s_state == EMDA_AT_STATE_IDLE && s_q_count == 0U) ? 1 : 0;
     emda_port_exit_critical();
+
+    /* 缓冲头部挂着半条 URC 时不能插新指令，否则会把它的后半段当响应 */
+    if (ready && s_rx_len > 0U)
+    {
+        const emda_urc_entry_t *entry = NULL;
+        uint16_t seg = 0U;
+
+        s_rx_prepare();
+        if (s_urc_probe(&s_rx[s_rx_head], s_rx_len, &entry, &seg) == -1)
+        {
+            ready = 0;
+        }
+    }
+
     return ready;
 }
 
@@ -215,7 +597,7 @@ int emda_at_submit_raw(const char *cmd,
         return EMDA_EINVAL;
     }
 
-    /* 两段式发送不能被排队(数据缓冲只有一份)，必须等事务空闲 */
+    /* 两段式发送不能排队(数据缓冲只有一份)，必须等事务空闲 */
     if (!emda_at_ready())
     {
         return EMDA_EBUSY;
@@ -232,249 +614,41 @@ int emda_at_submit_raw(const char *cmd,
 }
 
 /* ======================================================================== */
-/*                          URC 回调表                                        */
+/*                          URC 表管理                                        */
 /* ======================================================================== */
 
-int emda_at_urc_attach(const char *name, emda_urc_cb_t callback)
+int emda_at_urc_attach(const emda_urc_t *table, uint32_t count)
 {
-    if (name == NULL || callback == NULL)
+    if (table == NULL || count == 0U)
     {
         return EMDA_EINVAL;
     }
 
-    for (uint32_t i = 0U; i < EMDA_URC_TABLE_SIZE; i++)
+    for (uint32_t i = 0U; i < count; i++)
     {
-        if (!s_urc_table[i].is_used)
+        if (table[i].prefix == NULL)
         {
-            s_urc_table[i].is_used = 1U;
-            strncpy(s_urc_table[i].name, name, EMDA_NAME_LEN - 1U);
-            s_urc_table[i].name[EMDA_NAME_LEN - 1U] = '\0';
-            s_urc_table[i].cb = callback;
-            return EMDA_EOK;
+            continue;
         }
-    }
-    return EMDA_ENOMEM;
-}
-
-int emda_at_urc_dispatch(const uint8_t *buffer, uint16_t len)
-{
-    int handled = EMDA_ERROR;
-
-    if (buffer == NULL || len == 0U)
-    {
-        return EMDA_EINVAL;
-    }
-
-    for (uint32_t i = 0U; i < EMDA_URC_TABLE_SIZE; i++)
-    {
-        if (s_urc_table[i].is_used)
+        if (s_urc_count >= EMDA_URC_TABLE_SIZE)
         {
-            if (s_urc_table[i].cb(buffer, len) == EMDA_EOK)
-            {
-                /* 同一聚合窗口可能包含多个URC，命中后继续通知后续回调 */
-                handled = EMDA_EOK;
-            }
+            return EMDA_ENOMEM;
         }
-    }
-    return handled;
-}
 
-/* ======================================================================== */
-/*                       接收窗口聚合                                        */
-/* ======================================================================== */
-
-static void s_resp_reset(void)
-{
-    s_resp_buffer[0] = '\0';
-    s_resp_len = 0U;
-}
-
-static void s_rx_window_reset(void)
-{
-    s_rx_collect_buffer[0] = '\0';
-    s_rx_win_state = RX_WIN_IDLE;
-    s_rx_win_last_tick = 0U;
-    s_rx_win_len = 0U;
-}
-
-static int s_rx_window_has_text_boundary(void)
-{
-    return (s_rx_win_len >= 2U &&
-            s_rx_collect_buffer[s_rx_win_len - 2U] == '\r' &&
-            s_rx_collect_buffer[s_rx_win_len - 1U] == '\n') ? 1 : 0;
-}
-
-static int s_rx_window_publish(uint16_t *out_frame_len)
-{
-    if (out_frame_len == NULL || s_rx_win_len == 0U)
-    {
-        return EMDA_ERROR;
+        s_urc[s_urc_count].prefix = table[i].prefix;
+        s_urc[s_urc_count].prefix_len = (uint16_t)strlen(table[i].prefix);
+        s_urc[s_urc_count].seg_len = table[i].seg_len;
+        s_urc[s_urc_count].handler = table[i].handler;
+        s_urc_count++;
     }
 
-    *out_frame_len = s_rx_win_len;
-    s_rx_collect_buffer[s_rx_win_len] = '\0';
-    s_rx_win_state = RX_WIN_IDLE;
-    s_rx_win_len = 0U;
     return EMDA_EOK;
-}
-
-/**
- * @brief 非阻塞接收采集(每次调用最多读取一帧)
- *
- * 1. 非阻塞读取一个 port 帧并追加到采集缓冲
- * 2. 数据以 CRLF 结尾或缓冲已满 -> 立即交付
- * 3. 其它数据在 EMDA_RX_WINDOW_MS 内无新分片后交付
- */
-static int s_rx_window_step(emda_tick_t now, uint16_t *out_frame_len)
-{
-    uint16_t remaining;
-    uint16_t frame_len = 0U;
-
-    if (out_frame_len == NULL)
-    {
-        return EMDA_EINVAL;
-    }
-    *out_frame_len = 0U;
-
-    if (s_rx_win_len >= EMDA_RX_WINDOW_BUFFER_SIZE)
-    {
-        return s_rx_window_publish(out_frame_len);
-    }
-
-    remaining = (uint16_t)(EMDA_RX_WINDOW_BUFFER_SIZE - s_rx_win_len);
-    if (remaining > 0U &&
-        emda_port_uart_read_frame(&s_rx_collect_buffer[s_rx_win_len],
-                                  remaining,
-                                  &frame_len,
-                                  0U) == EMDA_EOK &&
-        frame_len > 0U)
-    {
-        if (frame_len > remaining)
-        {
-            frame_len = remaining;
-        }
-
-        s_rx_win_len = (uint16_t)(s_rx_win_len + frame_len);
-        s_rx_collect_buffer[s_rx_win_len] = '\0';
-        s_rx_win_last_tick = now;
-        s_rx_win_state = RX_WIN_COLLECTING;
-
-        if (s_rx_win_len >= EMDA_RX_WINDOW_BUFFER_SIZE ||
-            s_rx_window_has_text_boundary())
-        {
-            return s_rx_window_publish(out_frame_len);
-        }
-        return EMDA_ERROR;
-    }
-
-    if (s_rx_win_state == RX_WIN_COLLECTING)
-    {
-        if ((now - s_rx_win_last_tick) >= emda_tick_from_ms(EMDA_RX_WINDOW_MS))
-        {
-            return s_rx_window_publish(out_frame_len);
-        }
-    }
-
-    return EMDA_ERROR;
-}
-
-/* ======================================================================== */
-/*                       响应累积与分发                                      */
-/* ======================================================================== */
-
-/**
- * @brief 把新数据追加到当前事务的响应缓冲。
- *        溢出时丢弃最旧数据，始终保留最近 EMDA_RX_WINDOW_BUFFER_SIZE 字节。
- */
-static void s_resp_append(const uint8_t *buffer, uint16_t len)
-{
-    if (buffer == NULL || len == 0U)
-    {
-        return;
-    }
-
-    if (len >= EMDA_RX_WINDOW_BUFFER_SIZE)
-    {
-        memcpy(s_resp_buffer, &buffer[len - EMDA_RX_WINDOW_BUFFER_SIZE],
-               EMDA_RX_WINDOW_BUFFER_SIZE);
-        s_resp_len = EMDA_RX_WINDOW_BUFFER_SIZE;
-    }
-    else
-    {
-        uint32_t combined = (uint32_t)s_resp_len + (uint32_t)len;
-        if (combined > EMDA_RX_WINDOW_BUFFER_SIZE)
-        {
-            uint16_t discard = (uint16_t)(combined - EMDA_RX_WINDOW_BUFFER_SIZE);
-            memmove(s_resp_buffer, &s_resp_buffer[discard],
-                    (uint16_t)(s_resp_len - discard));
-            s_resp_len = (uint16_t)(s_resp_len - discard);
-        }
-        memcpy(&s_resp_buffer[s_resp_len], buffer, len);
-        s_resp_len = (uint16_t)(s_resp_len + len);
-    }
-
-    s_resp_buffer[s_resp_len] = '\0';
-}
-
-/**
- * @brief 检查累积响应中是否出现提示符，出现且未发过数据则发送原始数据
- */
-static void s_try_send_payload(void)
-{
-    if (s_prompt == NULL || s_payload_sent != 0U || s_payload_len == 0U)
-    {
-        return;
-    }
-
-    if (strstr((const char *)s_resp_buffer, s_prompt) == NULL)
-    {
-        return;
-    }
-
-    if (emda_port_uart_send(s_payload, s_payload_len) == EMDA_EOK)
-    {
-        s_payload_sent = 1U;
-        EMDA_LOG("[emda_at] payload sent %u bytes\r\n", (unsigned)s_payload_len);
-    }
-}
-
-/**
- * @brief 分发一段新接收数据：先通知全部URC，再喂给当前在途事务
- *        AT回调只在有新数据到达时调用，不重复解析旧缓冲。
- */
-static void s_dispatch_frame(emda_tick_t now, const uint8_t *buffer, uint16_t len)
-{
-    if (buffer == NULL || len == 0U)
-    {
-        return;
-    }
-
-    /* URC既可处理模组主动上报，也可作为主动指令响应的兜底处理路径 */
-    (void)emda_at_urc_dispatch(buffer, len);
-
-    if ((s_state == EMDA_AT_STATE_SEND || s_state == EMDA_AT_STATE_WAITING) &&
-        s_resp_cb != NULL)
-    {
-        s_resp_append(buffer, len);
-        s_try_send_payload();
-
-        if (s_resp_cb(s_resp_buffer, s_resp_len) == EMDA_EOK)
-        {
-            s_resp_cb = NULL;
-            s_state = EMDA_AT_STATE_RESP_OK;
-            s_ok_tick = now;
-        }
-    }
 }
 
 /* ======================================================================== */
 /*                       指令加载与初始化                                    */
 /* ======================================================================== */
 
-/**
- * @brief 把一条指令加载到事务入口，进入 SEND 状态
- * @note 调用前 s_prompt / s_payload / s_payload_sent 已就绪(或为普通指令)
- */
 static void s_load_command(emda_tick_t now,
                            const char *cmd,
                            uint16_t cmd_len,
@@ -519,7 +693,11 @@ int emda_at_init(void)
     s_payload_sent = 0U;
 
     s_resp_reset();
-    s_rx_window_reset();
+
+    s_rx_head = 0U;
+    s_rx_len = 0U;
+
+    s_urc_count = 0U;
 
     return emda_port_uart_init();
 }
@@ -528,10 +706,10 @@ int emda_at_init(void)
 /*                       主轮询(非阻塞)                                      */
 /* ======================================================================== */
 /*
- * 每轮：收串口帧 -> URC/响应分发 -> AT状态机推进一步
+ * 每轮：收串口字节 -> 解析(URC/响应) -> AT状态机推进一步
  *
  * 节奏控制：
- *   - UART 接收和 URC 分发每轮都执行，不受冷却/推进间隔限制
+ *   - 收数据与解析每轮都执行，不受冷却/推进间隔限制
  *   - AT 状态机按 EMDA_LOOP_INTERVAL_MS 推进
  *   - RESP_OK 冷却只限制下一条发送，期间仍持续处理 RX/URC
  */
@@ -539,15 +717,12 @@ void emda_at_poll(void)
 {
     emda_tick_t now = emda_tick_get();
     emda_tick_t interval;
-    uint16_t frame_len = 0U;
 
-    /* ============== [1] 串口接收 + URC/响应分发(始终执行) ============== */
-    if (s_rx_window_step(now, &frame_len) == EMDA_EOK && frame_len > 0U)
-    {
-        s_dispatch_frame(now, s_rx_collect_buffer, frame_len);
-    }
+    /* ============== [1] 接收 + 解析(始终执行) ============== */
+    s_rx_pump();
+    s_rx_parse(now);
 
-    /* RX/URC 处理完成后，才对状态机推进做节奏限制 */
+    /* 解析完成后才对状态机推进做节奏限制 */
     interval = emda_tick_from_ms(EMDA_LOOP_INTERVAL_MS);
     if ((now - s_step_tick) < interval)
     {
@@ -561,12 +736,6 @@ void emda_at_poll(void)
     case EMDA_AT_STATE_IDLE:
     {
         emda_at_msg_t msg;
-
-        /* 已收到部分数据时先等它分发完，避免跨事务混入下一条响应 */
-        if (s_rx_win_state == RX_WIN_COLLECTING)
-        {
-            break;
-        }
 
         if (s_queue_pop(&msg) == EMDA_EOK)
         {
@@ -591,7 +760,7 @@ void emda_at_poll(void)
 
     case EMDA_AT_STATE_WAITING:
     {
-        /* 响应回调由分发路径在新数据到达时触发；这里只管总超时 */
+        /* 响应回调由解析路径触发；这里只管总超时 */
         if ((now - s_send_tick) >= emda_tick_from_ms(s_cur_timeout_ms))
         {
             EMDA_LOG("[emda_at] timeout: %s", s_cur_cmd);

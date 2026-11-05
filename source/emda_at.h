@@ -3,21 +3,24 @@
  * @author Zorian(1551769443@qq.com)
  * @brief  EMDA AT 事务核心(对应 RT-Thread AT 包里的 at_client)
  *
- * 只做一件事：把「一条 AT 指令 + 它的响应」可靠地跑完，并把模组主动上报
- * (URC) 分发给注册者。不关心业务语义，不认识任何具体模组。
+ * 只做两件事：
+ *   1. 把「一条 AT 指令 + 它的响应」可靠地跑完
+ *   2. 把串口字节流按 AT 语法切成两种东西：URC 段 / 响应文本行
  *
- * 关键机制：
- *   1. 事务状态机 IDLE -> SEND -> WAITING -> RESP_OK / TIMEOUT
- *      任一时刻只有一条指令在途，响应经回调解析，成功即结束事务
- *   2. 指令队列：业务临时指令入队，IDLE 时按 FIFO 取出执行
- *   3. 接收窗口聚合：DMA 分帧的零散数据在时间窗内拼成完整响应
- *      文本帧(以CRLF结尾)立即分发，其余以 EMDA_RX_WINDOW_MS 静默兜底
- *   4. URC 全局回调表：每帧数据先分发给所有 URC 回调，再喂给在途事务
- *   5. 两段式发送：指令 -> 等待提示符(如">") -> 发送原始数据
+ * 接收模型(不靠时间窗猜边界)：
+ *   - 串口字节流先进环形缓冲，缓冲里始终是连续内存
+ *   - 每次轮询按下面的顺序解析缓冲头部，能切出多少切多少：
+ *       a) 两段式发送的提示符(如 ">")
+ *       b) URC 段：前缀匹配 + 可选长度回调，整段到齐才回调
+ *       c) 响应文本行：按 CRLF 切行，累积后交给 resp_cb
+ *   - 前缀命中但整段还没收全时直接停住等待，绝不把半条 URC 当文本行
+ *
+ * 这样二进制 payload 由 URC 表按长度精确圈走，不经过任何文本匹配，
+ * 也就不会出现"payload 里带 \r\n / 0x00 导致误判"的问题。
  *
  * 依赖关系：只依赖 emda_config.h / emda_def.h / emda_port.h
  *
- * @version 0.3
+ * @version 0.4
  * @date 2026-11-06
  *
  * @copyright Copyright (c) 2026
@@ -38,11 +41,11 @@
 /**
  * @brief AT指令响应回调
  *
- * 每次有新数据到达都会被调用，buffer 是本次事务至今的累积响应(以'\0'结尾)。
- * 因此可以跨多帧分片解析，只要任一次返回 EMDA_EOK 即视为事务成功。
+ * 每收到一整行文本就会调用一次，buffer 是本次事务至今的累积响应(以'\0'结尾)，
+ * 因此可以跨行/跨分片解析，任一次返回 EMDA_EOK 即视为事务成功。
  *
- * @param buffer 累积响应数据
- * @param len    累积数据长度
+ * @param buffer 累积响应文本
+ * @param len    累积长度
  * @return EMDA_EOK=解析成功(结束事务), 其它=继续等待
  */
 typedef int (*emda_at_resp_cb_t)(uint8_t *buffer, uint16_t len);
@@ -55,12 +58,46 @@ typedef int (*emda_at_resp_cb_t)(uint8_t *buffer, uint16_t len);
 typedef int (*emda_at_timeout_cb_t)(char *cmd);
 
 /**
- * @brief URC 回调
- * @param buffer 本次收到的数据分片(不是累积缓冲)
- * @param len    数据长度
+ * @brief URC 处理回调
+ *
+ * data/len 是**完整的一条 URC**(含前缀、可能的裸数据、尾部)，保证连续。
+ * 因为可能含二进制，解析时请按长度处理，不要对该指针用 strlen/strstr。
+ *
  * @return EMDA_EOK=已处理, 其它=未处理
  */
-typedef int (*emda_urc_cb_t)(const uint8_t *buffer, uint16_t len);
+typedef int (*emda_urc_cb_t)(const uint8_t *data, uint16_t len);
+
+/**
+ * @brief 计算一条 URC 占用的总字节数(用于带裸数据的 URC)
+ *
+ * 典型实现：从 header 里解析出 <len>，返回 header 长度 + <len>。
+ *
+ * @param buffer 缓冲头部(从前缀开始，保证连续)
+ * @param avail  当前可用的总字节数
+ * @return >0 该条 URC 的总长度；0 数据还没收全(等更多)；<0 格式不认识
+ */
+typedef int (*emda_urc_seg_cb_t)(const uint8_t *buffer, uint16_t avail);
+
+/* ======================================================================== */
+/*                          URC 表                                           */
+/* ======================================================================== */
+
+/**
+ * @brief 一条 URC 描述
+ *
+ *  - prefix  : 必须从缓冲头部开始匹配的字符串，如 "+MIPURC: \"rtcp\","
+ *  - seg_len : 计算整条长度的回调；传 NULL 表示"取到 CRLF 为止的一行"
+ *  - handler : 整条到齐后的处理函数
+ *
+ * 表中顺序即优先级：先注册先匹配。带裸数据的条目要排在通用条目之前，
+ * 例如 "+MIPURC: \"rtcp\"," 要排在 "+MIPURC:" 之前。
+ */
+typedef struct
+{
+    const char *prefix;
+    emda_urc_seg_cb_t seg_len;
+    emda_urc_cb_t handler;
+} emda_urc_t;
 
 /* ======================================================================== */
 /*                          AT 事务状态机                                    */
@@ -80,7 +117,7 @@ typedef enum
 /* ======================================================================== */
 
 /**
- * @brief AT 核心初始化：复位状态机 + 调用 port 层 UART 初始化
+ * @brief AT 核心初始化：复位状态机/接收缓冲 + 调用 port 层 UART 初始化
  * @return EMDA_EOK / EMDA_EIO
  */
 int emda_at_init(void);
@@ -88,8 +125,8 @@ int emda_at_init(void);
 /**
  * @brief 推进 AT 核心(非阻塞)
  *
- * 每轮执行：收串口帧 -> URC分发 -> AT状态机推进一步 -> 空闲时从队列取指令
- * 需高频调用；RX/URC 不受 EMDA_LOOP_INTERVAL_MS 限制。
+ * 每轮执行：收串口字节 -> 解析 URC/响应 -> AT 状态机推进一步
+ * 需高频调用；接收解析不受 EMDA_LOOP_INTERVAL_MS 限制。
  */
 void emda_at_poll(void);
 
@@ -130,25 +167,26 @@ int emda_at_submit_raw(const char *cmd,
 /* ---- URC ---- */
 
 /**
- * @brief 注册 URC 回调
- * @param name     注册名称(便于调试)
- * @param callback 回调函数
- * @return EMDA_EOK=成功, EMDA_ENOMEM=表满
+ * @brief 注册一张 URC 表
+ *
+ * 模组类在 init 里调用一次即可。表内 prefix/seg_len/handler 都按
+ * 静态生命周期使用，不做拷贝。
+ *
+ * @param table URC 描述数组
+ * @param count 数组元素个数
+ * @return EMDA_EOK / EMDA_EINVAL / EMDA_ENOMEM(表满)
  */
-int emda_at_urc_attach(const char *name, emda_urc_cb_t callback);
-
-/**
- * @brief URC 全局分发(引擎内部调用，通常无需直接调用)
- *        同一帧会通知所有已注册回调，不会因首个命中而停止。
- */
-int emda_at_urc_dispatch(const uint8_t *buffer, uint16_t len);
+int emda_at_urc_attach(const emda_urc_t *table, uint32_t count);
 
 /* ---- 状态查询 ---- */
 
 /**
- * @brief 事务层是否完全空闲(无在途指令、队列为空、无半帧数据)
- *        设备层/网络层据此决定是否发起新事务
- * @return 1=空闲, 0=忙
+ * @brief 事务层是否可发起新指令
+ *
+ * 条件：状态机 IDLE、指令队列为空、且缓冲头部不是"半条 URC"。
+ * 最后一条很关键——不能在半条 URC 还没收全时插进一条新指令。
+ *
+ * @return 1=可发起, 0=忙
  */
 int emda_at_ready(void);
 
@@ -161,5 +199,10 @@ emda_at_state_t emda_at_state_get(void);
  * @brief 获取待处理指令队列长度(调试用)
  */
 uint8_t emda_at_queue_count(void);
+
+/**
+ * @brief 获取接收环形缓冲里未消费的字节数(调试用)
+ */
+uint16_t emda_at_rx_count(void);
 
 #endif /* EMDA_AT_H */
