@@ -136,7 +136,8 @@ void emda_at_poll(void);
  * 任意线程/中断上下文可调用；同一时刻只有一条指令在途。
  *
  * @param cmd        AT指令字符串(含\r\n)
- * @param resp_cb    响应回调(可为NULL，表示不解析响应)
+ * @param resp_cb    响应回调；传 NULL 表示 fire-and-forget，
+ *                   收到模组第一条响应行即结束事务(不再等超时)
  * @param timeout_ms 超时(ms)，0=使用 EMDA_AT_DEFAULT_TIMEOUT_MS
  * @param timeout_cb 超时回调(可为NULL)
  * @return EMDA_EOK=入队成功, EMDA_ENOMEM=队列满, EMDA_EINVAL=参数错误

@@ -448,9 +448,18 @@ static void s_rx_parse(emda_tick_t now)
             s_resp_append(data, consumed);
             s_rx_consume(consumed);
 
-            if (s_resp_cb != NULL && s_resp_cb(s_resp, s_resp_len) == EMDA_EOK)
+            if (s_resp_cb != NULL)
             {
-                s_resp_cb = NULL;
+                if (s_resp_cb(s_resp, s_resp_len) == EMDA_EOK)
+                {
+                    s_resp_cb = NULL;
+                    s_state = EMDA_AT_STATE_RESP_OK;
+                    s_ok_tick = now;
+                }
+            }
+            else
+            {
+                /* 没有解析回调 = fire-and-forget：收到首行响应即结束，不再等超时 */
                 s_state = EMDA_AT_STATE_RESP_OK;
                 s_ok_tick = now;
             }

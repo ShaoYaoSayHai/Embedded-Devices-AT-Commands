@@ -59,7 +59,8 @@ Embedded-Devices-AT-Commands/
 │       ├── emda_class_ml307a.h
 │       └── emda_class_ml307a.c 参考模组类：中移 ML307A（4G Cat.1）
 ├── example/
-│   └── emda_demo.c             业务层用法示例（裸机 / FreeRTOS / RT-Thread）
+│   ├── emda_demo.c             入门示例（裸机 / FreeRTOS / RT-Thread 三种驱动）
+│   └── emda_freertos_monitor.c 实际工程示例：存活/SIM/IP/MQTT 监控 + 断线重连
 ├── test/
 │   ├── fake_modem.h/.c         主机侧模拟模组（实现 emda_port 串口接口）
 │   └── test_main.c             冒烟测试：监控阶梯 / 建链 / 收发 / URC / 超时
