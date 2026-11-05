@@ -22,6 +22,7 @@ source/task_module_serial_comm.h
 build/
 *.o
 *.obj
+*.d
 *.elf
 *.bin
 *.hex
@@ -29,6 +30,10 @@ build/
 *.lst
 *.a
 *.exe
+
+# ---- AI 工具工作目录(临时分析产物，不提交) ----
+.workbuddy/
+.codebuddy/
 
 # ---- IDE / 编辑器 ----
 .vscode/
